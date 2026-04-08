@@ -6,6 +6,8 @@ services:
     container_name: fastmcp-server
     ports:
       - "${FASTMCP_HOST_PORT:-8001}:8000"
+    networks:
+      - mcpnet
     restart: unless-stopped
 
   n8n:
@@ -13,6 +15,8 @@ services:
     container_name: n8n
     ports:
       - "5678:5678"
+    networks:
+      - mcpnet
     environment:
       - N8N_HOST=0.0.0.0
       - N8N_PORT=5678
@@ -26,3 +30,7 @@ services:
 
 volumes:
   n8n_data:
+  
+networks:
+  mcpnet:
+    driver: bridge
