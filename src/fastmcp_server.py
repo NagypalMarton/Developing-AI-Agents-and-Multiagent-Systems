@@ -28,17 +28,10 @@ from bs4 import BeautifulSoup
 mcp = FastMCP("basic-tools")
 
 
-class FetchHtmlInput(BaseModel):
-	url: str = Field(description="Target URL to fetch")
+class FetchNewsBlocksInput(BaseModel):
+	url: str = Field(description="Target URL to fetch and parse")
 	timeout_seconds: int = Field(
 		default=15, ge=3, le=60, description="HTTP timeout in seconds"
-	)
-
-
-class ExtractNewsBlocksInput(BaseModel):
-	html: str = Field(description="Raw HTML content of a news homepage")
-	base_url: str = Field(
-		description="Base URL of the page to resolve relative article links"
 	)
 	limit: int = Field(default=20, ge=1, le=100, description="Maximum number of results")
 
@@ -49,16 +42,6 @@ class NewsBlock(BaseModel):
 	news_content: str
 	news_topics: list[str]
 	news_url: str
-
-
-class SummarizeTextInput(BaseModel):
-	text: str = Field(description="Long text to summarize")
-	max_sentences: int = Field(
-		default=3,
-		ge=1,
-		le=8,
-		description="Maximum number of sentences in the output summary",
-	)
 
 
 def _clean_text(value: str) -> str:
@@ -157,11 +140,12 @@ def _extract_node_hir_articles(soup: BeautifulSoup, base_url: str) -> list[NewsB
 
 def _extract_bme_news_cards(soup: BeautifulSoup, base_url: str) -> list[NewsBlock]:
 	items: list[NewsBlock] = []
-	for link in soup.find_all("a", href=True):
-		if not link.find(class_=re.compile(r"bme_news_card", re.I)):
+	for card in soup.select("div.bme_news_card, article.bme_news_card, section.bme_news_card"):
+		link = card.find_parent("a", href=True)
+		if not link:
 			continue
 
-		title_node = link.select_one("h4.bme_news_card-title, h3.bme_news_card-title, h4, h3")
+		title_node = card.select_one("h4.bme_news_card-title, h3.bme_news_card-title, h4, h3")
 		if not title_node:
 			continue
 
@@ -171,13 +155,13 @@ def _extract_bme_news_cards(soup: BeautifulSoup, base_url: str) -> list[NewsBloc
 
 		news_url = urljoin(base_url, link["href"])
 
-		content_node = link.select_one(".bme_news_card-body p, .bme_news_card-body")
+		content_node = card.select_one(".bme_news_card-body p, .bme_news_card-body")
 		news_content = _clean_text(content_node.get_text(" ", strip=True)) if content_node else news_title
 
-		date_node = link.select_one("datetime .field--name-created, .field--name-created")
+		date_node = card.select_one("datetime .field--name-created, .field--name-created")
 		news_date = _clean_text(date_node.get_text(" ", strip=True)) if date_node else ""
 
-		topic_nodes = link.select(".bme_news_card-tags li, .field--name-field-tags li")
+		topic_nodes = card.select(".bme_news_card-tags li, .field--name-field-tags li")
 		topics = _unique_topics([node.get_text(" ", strip=True) for node in topic_nodes])
 
 		items.append(
@@ -192,55 +176,7 @@ def _extract_bme_news_cards(soup: BeautifulSoup, base_url: str) -> list[NewsBloc
 	return items
 
 
-STOPWORDS = {
-	"a",
-	"az",
-	"egy",
-	"es",
-	"hogy",
-	"de",
-	"ha",
-	"is",
-	"mint",
-	"vagy",
-	"van",
-	"volt",
-	"to",
-	"the",
-	"and",
-	"for",
-	"with",
-	"this",
-	"that",
-	"from",
-	"are",
-	"was",
-	"were",
-	"you",
-	"your",
-	"their",
-	"about",
-	"into",
-	"over",
-	"under",
-	"can",
-	"will",
-	"not",
-	"have",
-	"has",
-	"had",
-}
-
-
-@mcp.tool
-def get_today() -> str:
-	"""Return the current date in ISO format."""
-	return date.today().isoformat()
-
-
-@mcp.tool
-def fetch_html(payload: FetchHtmlInput) -> str:
-	"""Download raw HTML from a URL using HTTP GET."""
+def _download_html(url: str, timeout_seconds: int) -> tuple[str, str]:
 	headers = {
 		"User-Agent": (
 			"Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -248,34 +184,32 @@ def fetch_html(payload: FetchHtmlInput) -> str:
 			"Chrome/124.0.0.0 Safari/537.36"
 		)
 	}
-	response = requests.get(payload.url, timeout=payload.timeout_seconds, headers=headers)
+	response = requests.get(url, timeout=timeout_seconds, headers=headers)
 	response.raise_for_status()
-	return response.text
+	return response.text, response.url
 
 
-@mcp.tool
-def extract_news_blocks(payload: ExtractNewsBlocksInput) -> list[NewsBlock]:
-	"""Extract news fields from homepage HTML in a structured JSON-friendly format."""
-	soup = BeautifulSoup(payload.html, "html.parser")
+def _extract_news_blocks_from_html(html: str, base_url: str, limit: int) -> list[NewsBlock]:
+	soup = BeautifulSoup(html, "html.parser")
 	results: list[NewsBlock] = []
 	seen_keys = set()
 
-	for block in _extract_node_hir_articles(soup, payload.base_url):
+	for block in _extract_node_hir_articles(soup, base_url):
 		key = (block.news_title.lower(), block.news_url)
 		if key in seen_keys:
 			continue
 		seen_keys.add(key)
 		results.append(block)
-		if len(results) >= payload.limit:
+		if len(results) >= limit:
 			return results
 
-	for block in _extract_bme_news_cards(soup, payload.base_url):
+	for block in _extract_bme_news_cards(soup, base_url):
 		key = (block.news_title.lower(), block.news_url)
 		if key in seen_keys:
 			continue
 		seen_keys.add(key)
 		results.append(block)
-		if len(results) >= payload.limit:
+		if len(results) >= limit:
 			return results
 
 	for candidate in _iter_news_candidates(soup):
@@ -293,7 +227,7 @@ def extract_news_blocks(payload: ExtractNewsBlocksInput) -> list[NewsBlock]:
 		if not link_node or not link_node.get("href"):
 			continue
 
-		news_url = urljoin(payload.base_url, link_node["href"])  # resolve relative links
+		news_url = urljoin(base_url, link_node["href"])
 
 		date_node = candidate.find("time")
 		if date_node and date_node.get("datetime"):
@@ -337,44 +271,39 @@ def extract_news_blocks(payload: ExtractNewsBlocksInput) -> list[NewsBlock]:
 			)
 		)
 
-		if len(results) >= payload.limit:
-			break
+		if len(results) >= limit:
+			return results
 
 	return results
 
 
+STOPWORDS = {
+	"a",
+	"az",
+	"egy",
+	"es",
+	"hogy",
+	"de",
+	"ha",
+	"is",
+	"mint",
+	"vagy",
+	"van",
+	"volt"
+}
+
+
 @mcp.tool
-def summarize_text(payload: SummarizeTextInput) -> str:
-	"""Create a concise extractive summary from long text."""
-	sentences = _split_sentences(payload.text)
-	if not sentences:
-		return ""
-	if len(sentences) <= payload.max_sentences:
-		return " ".join(sentences)
+def get_today() -> str:
+	"""Return the current date in ISO format."""
+	return date.today().isoformat()
 
-	tokens = [token for token in _tokenize(payload.text) if token not in STOPWORDS]
-	if not tokens:
-		return " ".join(sentences[: payload.max_sentences])
 
-	frequencies = Counter(tokens)
-	max_freq = max(frequencies.values())
-	normalized = {word: score / max_freq for word, score in frequencies.items()}
-
-	scored: list[tuple[int, float]] = []
-	for idx, sentence in enumerate(sentences):
-		sentence_tokens = [t for t in _tokenize(sentence) if t not in STOPWORDS]
-		if not sentence_tokens:
-			continue
-		score = sum(normalized.get(token, 0.0) for token in sentence_tokens)
-		scored.append((idx, score))
-
-	if not scored:
-		return " ".join(sentences[: payload.max_sentences])
-
-	top_indices = sorted(
-		[idx for idx, _ in sorted(scored, key=lambda item: item[1], reverse=True)[: payload.max_sentences]]
-	)
-	return " ".join(sentences[idx] for idx in top_indices)
+@mcp.tool
+def fetch_news_blocks(payload: FetchNewsBlocksInput) -> list[NewsBlock]:
+	"""Download a news page and extract structured news blocks in one step."""
+	html, resolved_url = _download_html(payload.url, payload.timeout_seconds)
+	return _extract_news_blocks_from_html(html, resolved_url, payload.limit)
 
 
 def run_server(host: str, port: int, path: str) -> None:
