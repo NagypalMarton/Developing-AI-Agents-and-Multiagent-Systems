@@ -36,6 +36,11 @@ class FetchNewsBlocksInput(BaseModel):
 	limit: int = Field(default=20, ge=1, le=100, description="Maximum number of results")
 
 
+class GetTodayInput(BaseModel):
+	# Empty object input to keep OpenAI-style function schema uniform across tools.
+	pass
+
+
 class NewsBlock(BaseModel):
 	news_title: str
 	news_date: str
@@ -294,8 +299,9 @@ STOPWORDS = {
 
 
 @mcp.tool
-def get_today() -> str:
+def get_today(payload: GetTodayInput) -> str:
 	"""Return the current date in ISO format."""
+	_ = payload
 	return date.today().isoformat()
 
 
