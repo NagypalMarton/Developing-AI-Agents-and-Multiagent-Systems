@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import argparse
 import re
-from collections import Counter
 from datetime import date
 from typing import Iterable
 from urllib.parse import urljoin
@@ -51,18 +50,6 @@ class NewsBlock(BaseModel):
 
 def _clean_text(value: str) -> str:
 	return re.sub(r"\s+", " ", value).strip()
-
-
-def _split_sentences(text: str) -> list[str]:
-	normalized = _clean_text(text)
-	if not normalized:
-		return []
-	parts = re.split(r"(?<=[.!?])\s+(?=[A-Z0-9])", normalized)
-	return [p.strip() for p in parts if p.strip()]
-
-
-def _tokenize(text: str) -> list[str]:
-	return re.findall(r"[^\W\d_]{3,}", text.lower(), flags=re.UNICODE)
 
 
 def _iter_news_candidates(soup: BeautifulSoup) -> Iterable:
@@ -280,24 +267,6 @@ def _extract_news_blocks_from_html(html: str, base_url: str, limit: int) -> list
 			return results
 
 	return results
-
-
-STOPWORDS = {
-	"a",
-	"az",
-	"egy",
-	"es",
-	"hogy",
-	"de",
-	"ha",
-	"is",
-	"mint",
-	"vagy",
-	"van",
-	"volt"
-}
-
-
 @mcp.tool
 def get_today(payload: GetTodayInput) -> str:
 	"""Return the current date in ISO format."""
