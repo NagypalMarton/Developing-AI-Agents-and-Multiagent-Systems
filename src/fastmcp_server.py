@@ -13,12 +13,18 @@ Required packages:
 from __future__ import annotations
 
 import argparse
+import os
 import re
 from datetime import date
 from typing import Iterable
 from urllib.parse import urljoin
 
 from fastmcp import FastMCP
+from opentelemetry import trace
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from openinference.instrumentation.pydantic_ai import OpenInferenceSpanProcessor
 from pydantic import BaseModel, Field
 import requests
 from bs4 import BeautifulSoup
@@ -267,6 +273,26 @@ def _extract_news_blocks_from_html(html: str, base_url: str, limit: int) -> list
 			return results
 
 	return results
+
+
+def setup_telemetry() -> None:
+	"""Configure OpenTelemetry export to Arize Phoenix using OTLP/HTTP."""
+	tracer_provider = TracerProvider()
+	trace.set_tracer_provider(tracer_provider)
+
+	collector_base = os.getenv("PHOENIX_COLLECTOR_ENDPOINT", "http://phoenix:6006").rstrip("/")
+	endpoint = f"{collector_base}/v1/traces"
+
+	headers: dict[str, str] | None = None
+	phoenix_api_key = os.getenv("PHOENIX_API_KEY")
+	if phoenix_api_key:
+		headers = {"Authorization": f"Bearer {phoenix_api_key}"}
+
+	exporter = OTLPSpanExporter(endpoint=endpoint, headers=headers)
+	tracer_provider.add_span_processor(OpenInferenceSpanProcessor())
+	tracer_provider.add_span_processor(SimpleSpanProcessor(exporter))
+
+
 @mcp.tool
 def get_today(payload: GetTodayInput) -> str:
 	"""Return the current date in ISO format."""
@@ -310,6 +336,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+	setup_telemetry()
 	args = parse_args()
 	run_server(host=args.host, port=args.port, path=args.path)
 
