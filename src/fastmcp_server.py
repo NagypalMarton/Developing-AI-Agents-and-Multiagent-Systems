@@ -7,7 +7,7 @@ Custom host/port/path:
 	python src/fastmcp_server.py --host 127.0.0.1 --port 8000 --path /mcp
 
 Required packages:
-	pip install fastmcp pydantic requests beautifulsoup4
+	pip install fastmcp pydantic requests beautifulsoup4 arize-phoenix arize-phoenix-otel pydantic-evals
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
+from difflib import SequenceMatcher
 from datetime import date
 from typing import Iterable
 from urllib.parse import urljoin
@@ -44,6 +45,76 @@ class FetchNewsBlocksInput(BaseModel):
 class GetTodayInput(BaseModel):
 	# Empty object input to keep OpenAI-style function schema uniform across tools.
 	pass
+
+
+class EvalCaseInput(BaseModel):
+	name: str = Field(description="Human-readable test case name")
+	input_text: str = Field(description="Input prompt to evaluate")
+	expected_output: str = Field(description="Expected answer for the input")
+
+
+class RunPhoenixPydanticEvalsInput(BaseModel):
+	project_name: str = Field(default="pydantic-evals-tutorial", description="defauklt")
+	llm_judge_model: str = Field(
+		default="openai:gpt-4o-mini",
+		description="Model identifier used by Pydantic Evals LLMJudge",
+	)
+	include_llm_judge: bool = Field(
+		default=False,
+		description="Include LLMJudge evaluator in addition to rule-based evaluators",
+	)
+	upload_annotations: bool = Field(
+		default=True,
+		description="Upload evaluator labels back to Phoenix span annotations",
+	)
+	fuzzy_threshold: float = Field(
+		default=0.8,
+		ge=0.0,
+		le=1.0,
+		description="Similarity threshold for fuzzy matching evaluator",
+	)
+	cases: list[EvalCaseInput] = Field(
+		default_factory=lambda: [
+			EvalCaseInput(
+				name="capital of France",
+				input_text="What is the capital of France?",
+				expected_output="Paris",
+			),
+			EvalCaseInput(
+				name="author of Romeo and Juliet",
+				input_text="Who wrote Romeo and Juliet?",
+				expected_output="William Shakespeare",
+			),
+			EvalCaseInput(
+				name="largest planet",
+				input_text="What is the largest planet in our solar system?",
+				expected_output="Jupiter",
+			),
+		],
+		description="Evaluation dataset cases",
+	)
+
+
+class EvalCaseResult(BaseModel):
+	name: str
+	input_text: str
+	expected_output: str
+	output: str
+	exact_match: bool
+	fuzzy_match: bool
+	llm_match: bool | None = None
+
+
+class RunPhoenixPydanticEvalsOutput(BaseModel):
+	project_name: str
+	total_cases: int
+	exact_match_rate: float
+	fuzzy_match_rate: float
+	llm_match_rate: float | None = None
+	uploaded_annotations: list[str]
+	notes: list[str]
+	cases: list[EvalCaseResult]
+	report: dict[str, object]
 
 
 class NewsBlock(BaseModel):
@@ -275,6 +346,37 @@ def _extract_news_blocks_from_html(html: str, base_url: str, limit: int) -> list
 	return results
 
 
+def _message_content(value: object, preferred_role: str | None = None) -> str:
+	if not isinstance(value, list):
+		return ""
+	for item in value:
+		if not isinstance(item, dict):
+			continue
+		message = item.get("message", item)
+		if not isinstance(message, dict):
+			continue
+		role = message.get("role")
+		if preferred_role and role != preferred_role:
+			continue
+		content = message.get("content")
+		if isinstance(content, str):
+			return _clean_text(content)
+		if isinstance(content, list):
+			parts: list[str] = []
+			for part in content:
+				if isinstance(part, dict):
+					text = part.get("text")
+					if isinstance(text, str) and text.strip():
+						parts.append(text)
+			if parts:
+				return _clean_text(" ".join(parts))
+	return ""
+
+
+def _similarity_ratio(a: str, b: str) -> float:
+	return SequenceMatcher(None, a, b).ratio()
+
+
 def setup_telemetry() -> None:
 	"""Configure OpenTelemetry export to Arize Phoenix using OTLP/HTTP."""
 	tracer_provider = TracerProvider()
@@ -305,6 +407,176 @@ def fetch_news_blocks(payload: FetchNewsBlocksInput) -> list[NewsBlock]:
 	"""Download a news page and extract structured news blocks in one step."""
 	html, resolved_url = _download_html(payload.url, payload.timeout_seconds)
 	return _extract_news_blocks_from_html(html, resolved_url, payload.limit)
+
+
+@mcp.tool
+def run_phoenix_pydantic_evals(payload: RunPhoenixPydanticEvalsInput) -> RunPhoenixPydanticEvalsOutput:
+	"""Run Pydantic Evals over Phoenix traces and optionally upload evaluation labels."""
+	from phoenix.otel import register
+	from phoenix.client import Client
+	from phoenix.client.types.spans import SpanQuery
+	from pydantic_evals import Case, Dataset
+	from pydantic_evals.evaluators import Evaluator, EvaluatorContext, LLMJudge
+
+	notes: list[str] = []
+	uploaded_annotations: list[str] = []
+
+	register(project_name=payload.project_name, auto_instrument=True)
+
+	query = SpanQuery().select("llm.input_messages", "llm.output_messages")
+	phoenix_client = Client()
+	spans = phoenix_client.spans.get_spans_dataframe(query=query, project_name=payload.project_name)
+
+	if spans.empty:
+		return RunPhoenixPydanticEvalsOutput(
+			project_name=payload.project_name,
+			total_cases=0,
+			exact_match_rate=0.0,
+			fuzzy_match_rate=0.0,
+			llm_match_rate=None,
+			uploaded_annotations=[],
+			notes=["No spans found in Phoenix for the selected project."],
+			cases=[],
+			report={},
+		)
+
+	spans = spans.rename(columns={"llm.input_messages": "input", "llm.output_messages": "output"})
+	spans["input"] = spans["input"].apply(lambda x: _message_content(x, preferred_role="user"))
+	spans["output"] = spans["output"].apply(lambda x: _message_content(x, preferred_role="assistant"))
+
+	lookup: dict[str, str] = {}
+	for _, row in spans.iterrows():
+		input_text = _clean_text(str(row.get("input", "")))
+		output_text = _clean_text(str(row.get("output", "")))
+		if input_text and output_text and input_text not in lookup:
+			lookup[input_text] = output_text
+
+	class MatchesExpectedOutput(Evaluator[str, str]):
+		def evaluate(self, ctx: EvaluatorContext[str, str]) -> bool:
+			return _clean_text(ctx.expected_output) == _clean_text(ctx.output)
+
+	class FuzzyMatchesOutput(Evaluator[str, str]):
+		def __init__(self, threshold: float) -> None:
+			self.threshold = threshold
+
+		def evaluate(self, ctx: EvaluatorContext[str, str]) -> bool:
+			score = _similarity_ratio(_clean_text(ctx.expected_output).lower(), _clean_text(ctx.output).lower())
+			return score >= self.threshold
+
+	def task(input_text: str) -> str:
+		result = lookup.get(_clean_text(input_text))
+		if result is None:
+			raise KeyError(f"No traced output found for input: {input_text}")
+		return result
+
+	cases = [
+		Case(name=case.name, inputs=case.input_text, expected_output=case.expected_output)
+		for case in payload.cases
+	]
+	dataset = Dataset(cases=cases, evaluators=[MatchesExpectedOutput(), FuzzyMatchesOutput(payload.fuzzy_threshold)])
+
+	if payload.include_llm_judge:
+		dataset.add_evaluator(
+			LLMJudge(
+				rubric=(
+					"Output and Expected Output should represent the same answer, "
+					"even if the text does not match exactly"
+				),
+				include_input=True,
+				model=payload.llm_judge_model,
+			)
+		)
+
+	report = dataset.evaluate_sync(task)
+	report_data = report.model_dump()
+
+	case_results: list[EvalCaseResult] = []
+	exact_hits = 0
+	fuzzy_hits = 0
+	llm_hits = 0
+	llm_count = 0
+
+	for case in report_data.get("cases", []):
+		assertions = case.get("assertions", {})
+		exact_match = bool(assertions.get("MatchesExpectedOutput", {}).get("value", False))
+		fuzzy_match = bool(assertions.get("FuzzyMatchesOutput", {}).get("value", False))
+		llm_value_raw = assertions.get("LLMJudge", {}).get("value")
+		llm_match = bool(llm_value_raw) if llm_value_raw is not None else None
+
+		if exact_match:
+			exact_hits += 1
+		if fuzzy_match:
+			fuzzy_hits += 1
+		if llm_match is not None:
+			llm_count += 1
+			if llm_match:
+				llm_hits += 1
+
+		input_text = str(case.get("inputs", ""))
+		case_results.append(
+			EvalCaseResult(
+				name=str(case.get("name", "")),
+				input_text=input_text,
+				expected_output=str(case.get("expected_output", "")),
+				output=lookup.get(_clean_text(input_text), ""),
+				exact_match=exact_match,
+				fuzzy_match=fuzzy_match,
+				llm_match=llm_match,
+			)
+		)
+
+	if payload.upload_annotations:
+		eval_frames = {
+			"Direct Match Eval": spans.copy(),
+			"Fuzzy Match Eval": spans.copy(),
+		}
+		if payload.include_llm_judge:
+			eval_frames["LLM Match Eval"] = spans.copy()
+
+		for eval_case in report_data.get("cases", []):
+			assertions = eval_case.get("assertions", {})
+			input_text = str(eval_case.get("inputs", ""))
+
+			labels: dict[str, object] = {
+				"Direct Match Eval": assertions.get("MatchesExpectedOutput", {}).get("value"),
+				"Fuzzy Match Eval": assertions.get("FuzzyMatchesOutput", {}).get("value"),
+			}
+			if payload.include_llm_judge:
+				labels["LLM Match Eval"] = assertions.get("LLMJudge", {}).get("value")
+
+			for annotation_name, label_value in labels.items():
+				df = eval_frames[annotation_name]
+				df.loc[df["input"] == input_text, "label"] = str(label_value)
+
+		for annotation_name, df in eval_frames.items():
+			df["score"] = df["label"].apply(lambda x: 1 if str(x) == "True" else 0)
+			annotator_kind = "LLM" if annotation_name == "LLM Match Eval" else "CODE"
+			phoenix_client.spans.log_span_annotations_dataframe(
+				dataframe=df,
+				annotation_name=annotation_name,
+				annotator_kind=annotator_kind,
+			)
+			uploaded_annotations.append(annotation_name)
+
+	total_cases = len(case_results)
+	exact_match_rate = (exact_hits / total_cases) if total_cases else 0.0
+	fuzzy_match_rate = (fuzzy_hits / total_cases) if total_cases else 0.0
+	llm_match_rate = (llm_hits / llm_count) if llm_count else None
+
+	if not lookup:
+		notes.append("No usable input/output rows were extracted from spans.")
+
+	return RunPhoenixPydanticEvalsOutput(
+		project_name=payload.project_name,
+		total_cases=total_cases,
+		exact_match_rate=exact_match_rate,
+		fuzzy_match_rate=fuzzy_match_rate,
+		llm_match_rate=llm_match_rate,
+		uploaded_annotations=uploaded_annotations,
+		notes=notes,
+		cases=case_results,
+		report=report_data,
+	)
 
 
 def run_server(host: str, port: int, path: str) -> None:

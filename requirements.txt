@@ -7,3 +7,7 @@ pydantic-ai
 opentelemetry-sdk
 opentelemetry-exporter-otlp
 opentelemetry-api
+arize-phoenix-otel
+pydantic-evals
+arize-phoenix 
+openinference-instrumentation-mistralai
