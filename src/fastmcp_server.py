@@ -460,6 +460,31 @@ def run_phoenix_pydantic_evals(payload: RunPhoenixPydanticEvalsInput) -> RunPhoe
 		if input_text and output_text and input_text not in lookup:
 			lookup[input_text] = output_text
 
+	available_cases = [
+		case for case in payload.cases if _clean_text(case.input_text) in lookup
+	]
+	missing_case_inputs = [
+		case.input_text for case in payload.cases if _clean_text(case.input_text) not in lookup
+	]
+
+	if missing_case_inputs:
+		notes.append(
+			f"Skipped {len(missing_case_inputs)} case(s) with no matching traced input."
+		)
+
+	if not available_cases:
+		return RunPhoenixPydanticEvalsOutput(
+			project_name=payload.project_name,
+			total_cases=0,
+			exact_match_rate=0.0,
+			fuzzy_match_rate=0.0,
+			llm_match_rate=None,
+			uploaded_annotations=[],
+			notes=notes + ["No evaluable cases remained after matching against traced inputs."],
+			cases=[],
+			report={},
+		)
+
 	class MatchesExpectedOutput(Evaluator[str, str]):
 		def evaluate(self, ctx: EvaluatorContext[str, str]) -> bool:
 			return _clean_text(ctx.expected_output) == _clean_text(ctx.output)
@@ -475,12 +500,13 @@ def run_phoenix_pydantic_evals(payload: RunPhoenixPydanticEvalsInput) -> RunPhoe
 	def task(input_text: str) -> str:
 		result = lookup.get(_clean_text(input_text))
 		if result is None:
-			raise KeyError(f"No traced output found for input: {input_text}")
+			# This should not happen after prefiltering, but keep a safe fallback.
+			return ""
 		return result
 
 	cases = [
 		Case(name=case.name, inputs=case.input_text, expected_output=case.expected_output)
-		for case in payload.cases
+		for case in available_cases
 	]
 	dataset = Dataset(cases=cases, evaluators=[MatchesExpectedOutput(), FuzzyMatchesOutput(payload.fuzzy_threshold)])
 
@@ -533,10 +559,15 @@ def run_phoenix_pydantic_evals(payload: RunPhoenixPydanticEvalsInput) -> RunPhoe
 			)
 		)
 
+	evaluated_inputs = {
+		_clean_text(str(case.get("inputs", ""))) for case in report_data.get("cases", [])
+	}
+	eval_spans = spans[spans["input"].apply(_clean_text).isin(evaluated_inputs)].copy()
+
 	eval_frames = {
-		"Direct Match Eval": spans.copy(),
-		"Fuzzy Match Eval": spans.copy(),
-		"LLM Match Eval": spans.copy(),
+		"Direct Match Eval": eval_spans.copy(),
+		"Fuzzy Match Eval": eval_spans.copy(),
+		"LLM Match Eval": eval_spans.copy(),
 	}
 
 	for eval_case in report_data.get("cases", []):
@@ -554,6 +585,9 @@ def run_phoenix_pydantic_evals(payload: RunPhoenixPydanticEvalsInput) -> RunPhoe
 			df.loc[df["input"] == input_text, "label"] = str(label_value)
 
 	for annotation_name, df in eval_frames.items():
+		if df.empty:
+			notes.append(f"Skipped annotation upload for {annotation_name}: no evaluated spans.")
+			continue
 		df["score"] = df["label"].apply(lambda x: 1 if str(x) == "True" else 0)
 		annotator_kind = "LLM" if annotation_name == "LLM Match Eval" else "CODE"
 		phoenix_client.spans.log_span_annotations_dataframe(
