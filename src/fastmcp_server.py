@@ -54,18 +54,13 @@ class EvalCaseInput(BaseModel):
 
 
 class RunPhoenixPydanticEvalsInput(BaseModel):
-	project_name: str = Field(default="pydantic-evals-tutorial", description="defauklt")
+	project_name: str = Field(
+		default="default",
+		description="Phoenix project name to query spans and upload annotations",
+	)
 	llm_judge_model: str = Field(
 		default="openai:gpt-4o-mini",
 		description="Model identifier used by Pydantic Evals LLMJudge",
-	)
-	include_llm_judge: bool = Field(
-		default=False,
-		description="Include LLMJudge evaluator in addition to rule-based evaluators",
-	)
-	upload_annotations: bool = Field(
-		default=True,
-		description="Upload evaluator labels back to Phoenix span annotations",
 	)
 	fuzzy_threshold: float = Field(
 		default=0.8,
@@ -377,6 +372,20 @@ def _similarity_ratio(a: str, b: str) -> float:
 	return SequenceMatcher(None, a, b).ratio()
 
 
+def _script_span_message_content(value: object, index: int) -> str:
+	"""Extract message content with the same index-based logic as the reference script."""
+	if not isinstance(value, list) or len(value) <= index:
+		return ""
+	item = value[index]
+	if not isinstance(item, dict):
+		return ""
+	message = item.get("message")
+	if not isinstance(message, dict):
+		return ""
+	content = message.get("content")
+	return _clean_text(content) if isinstance(content, str) else ""
+
+
 def setup_telemetry() -> None:
 	"""Configure OpenTelemetry export to Arize Phoenix using OTLP/HTTP."""
 	tracer_provider = TracerProvider()
@@ -441,8 +450,8 @@ def run_phoenix_pydantic_evals(payload: RunPhoenixPydanticEvalsInput) -> RunPhoe
 		)
 
 	spans = spans.rename(columns={"llm.input_messages": "input", "llm.output_messages": "output"})
-	spans["input"] = spans["input"].apply(lambda x: _message_content(x, preferred_role="user"))
-	spans["output"] = spans["output"].apply(lambda x: _message_content(x, preferred_role="assistant"))
+	spans["input"] = spans["input"].apply(lambda x: _script_span_message_content(x, 1) or _message_content(x, preferred_role="user"))
+	spans["output"] = spans["output"].apply(lambda x: _script_span_message_content(x, 0) or _message_content(x, preferred_role="assistant"))
 
 	lookup: dict[str, str] = {}
 	for _, row in spans.iterrows():
@@ -475,17 +484,16 @@ def run_phoenix_pydantic_evals(payload: RunPhoenixPydanticEvalsInput) -> RunPhoe
 	]
 	dataset = Dataset(cases=cases, evaluators=[MatchesExpectedOutput(), FuzzyMatchesOutput(payload.fuzzy_threshold)])
 
-	if payload.include_llm_judge:
-		dataset.add_evaluator(
-			LLMJudge(
-				rubric=(
-					"Output and Expected Output should represent the same answer, "
-					"even if the text does not match exactly"
-				),
-				include_input=True,
-				model=payload.llm_judge_model,
-			)
+	dataset.add_evaluator(
+		LLMJudge(
+			rubric=(
+				"Output and Expected Output should represent the same answer, "
+				"even if the text does not match exactly"
+			),
+			include_input=True,
+			model=payload.llm_judge_model,
 		)
+	)
 
 	report = dataset.evaluate_sync(task)
 	report_data = report.model_dump()
@@ -525,38 +533,35 @@ def run_phoenix_pydantic_evals(payload: RunPhoenixPydanticEvalsInput) -> RunPhoe
 			)
 		)
 
-	if payload.upload_annotations:
-		eval_frames = {
-			"Direct Match Eval": spans.copy(),
-			"Fuzzy Match Eval": spans.copy(),
+	eval_frames = {
+		"Direct Match Eval": spans.copy(),
+		"Fuzzy Match Eval": spans.copy(),
+		"LLM Match Eval": spans.copy(),
+	}
+
+	for eval_case in report_data.get("cases", []):
+		assertions = eval_case.get("assertions", {})
+		input_text = str(eval_case.get("inputs", ""))
+
+		labels: dict[str, object] = {
+			"Direct Match Eval": assertions.get("MatchesExpectedOutput", {}).get("value"),
+			"Fuzzy Match Eval": assertions.get("FuzzyMatchesOutput", {}).get("value"),
+			"LLM Match Eval": assertions.get("LLMJudge", {}).get("value"),
 		}
-		if payload.include_llm_judge:
-			eval_frames["LLM Match Eval"] = spans.copy()
 
-		for eval_case in report_data.get("cases", []):
-			assertions = eval_case.get("assertions", {})
-			input_text = str(eval_case.get("inputs", ""))
+		for annotation_name, label_value in labels.items():
+			df = eval_frames[annotation_name]
+			df.loc[df["input"] == input_text, "label"] = str(label_value)
 
-			labels: dict[str, object] = {
-				"Direct Match Eval": assertions.get("MatchesExpectedOutput", {}).get("value"),
-				"Fuzzy Match Eval": assertions.get("FuzzyMatchesOutput", {}).get("value"),
-			}
-			if payload.include_llm_judge:
-				labels["LLM Match Eval"] = assertions.get("LLMJudge", {}).get("value")
-
-			for annotation_name, label_value in labels.items():
-				df = eval_frames[annotation_name]
-				df.loc[df["input"] == input_text, "label"] = str(label_value)
-
-		for annotation_name, df in eval_frames.items():
-			df["score"] = df["label"].apply(lambda x: 1 if str(x) == "True" else 0)
-			annotator_kind = "LLM" if annotation_name == "LLM Match Eval" else "CODE"
-			phoenix_client.spans.log_span_annotations_dataframe(
-				dataframe=df,
-				annotation_name=annotation_name,
-				annotator_kind=annotator_kind,
-			)
-			uploaded_annotations.append(annotation_name)
+	for annotation_name, df in eval_frames.items():
+		df["score"] = df["label"].apply(lambda x: 1 if str(x) == "True" else 0)
+		annotator_kind = "LLM" if annotation_name == "LLM Match Eval" else "CODE"
+		phoenix_client.spans.log_span_annotations_dataframe(
+			dataframe=df,
+			annotation_name=annotation_name,
+			annotator_kind=annotator_kind,
+		)
+		uploaded_annotations.append(annotation_name)
 
 	total_cases = len(case_results)
 	exact_match_rate = (exact_hits / total_cases) if total_cases else 0.0
