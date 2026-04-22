@@ -1,6 +1,5 @@
 fastmcp
 pydantic
-requests
 beautifulsoup4
 openinference-instrumentation-pydantic-ai
 pydantic-ai

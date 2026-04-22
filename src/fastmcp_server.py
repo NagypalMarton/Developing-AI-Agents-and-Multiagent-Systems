@@ -7,7 +7,7 @@ Custom host/port/path:
 	python src/fastmcp_server.py --host 127.0.0.1 --port 8000 --path /mcp
 
 Required packages:
-	pip install fastmcp pydantic requests beautifulsoup4 arize-phoenix arize-phoenix-otel pydantic-evals
+	pip install fastmcp pydantic beautifulsoup4 arize-phoenix arize-phoenix-otel pydantic-evals
 """
 
 from __future__ import annotations
@@ -15,10 +15,11 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import shutil
 from difflib import SequenceMatcher
 from datetime import date
-from typing import Iterable, Literal
-from urllib.parse import urljoin
+from pathlib import Path
+from typing import Any, Iterable, Literal
 
 from fastmcp import FastMCP
 from opentelemetry import trace
@@ -27,21 +28,38 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from openinference.instrumentation.pydantic_ai import OpenInferenceSpanProcessor
 from pydantic import BaseModel, Field
-import requests
 from bs4 import BeautifulSoup
 
 
 mcp = FastMCP("basic-tools")
 
 
-class FetchUrlInput(BaseModel):
-	url: str = Field(description="Target URL")
+class RunWithWebFetchInput(BaseModel):
+	prompt: str = Field(description="Prompt that may require URL fetching")
+	model: str = Field(
+		default="mistral:mistral-large-latest",
+		description="Pydantic AI model identifier",
+	)
 
 
-class FetchUrlOutput(BaseModel):
-	status: int
-	content_type: str
-	body: str
+class RunWithWebFetchOutput(BaseModel):
+	response: str
+
+
+class RunWithMemoryToolInput(BaseModel):
+	prompt: str = Field(description="Prompt that may store or recall memory")
+	model: str = Field(
+		default="mistral:mistral-large-latest",
+		description="Pydantic AI model identifier",
+	)
+	memory_root: str = Field(
+		default=".agent-memory",
+		description="Directory used by the local memory backend",
+	)
+
+
+class RunWithMemoryToolOutput(BaseModel):
+	response: str
 
 
 class ExtractHtmlInput(BaseModel):
@@ -455,6 +473,131 @@ def _script_span_message_content(value: object, index: int) -> str:
 	return _clean_text(content) if isinstance(content, str) else ""
 
 
+def _memory_root(root_value: str) -> Path:
+	root = Path(root_value)
+	if not root.is_absolute():
+		root = Path.cwd() / root
+	root = root.resolve()
+	root.mkdir(parents=True, exist_ok=True)
+	return root
+
+
+def _memory_safe_path(root: Path, raw_path: str) -> Path:
+	relative = raw_path.strip().replace("\\", "/").lstrip("/")
+	if not relative:
+		raise ValueError("Memory path must not be empty.")
+	target = (root / relative).resolve()
+	if root != target and root not in target.parents:
+		raise ValueError("Memory path escapes configured memory root.")
+	return target
+
+
+def _memory_view(root: Path, path: str) -> str | list[str]:
+	target = _memory_safe_path(root, path)
+	if target.is_dir():
+		entries: list[str] = []
+		for child in sorted(target.iterdir(), key=lambda item: item.name.lower()):
+			suffix = "/" if child.is_dir() else ""
+			entries.append(f"{child.name}{suffix}")
+		return entries
+	if not target.exists():
+		return ""
+	return target.read_text(encoding="utf-8")
+
+
+def _memory_create(root: Path, path: str, file_text: str) -> str:
+	target = _memory_safe_path(root, path)
+	if target.exists():
+		raise ValueError("Memory create failed: path already exists.")
+	target.parent.mkdir(parents=True, exist_ok=True)
+	target.write_text(file_text, encoding="utf-8")
+	return f"Created {path}."
+
+
+def _memory_str_replace(root: Path, path: str, old_str: str, new_str: str) -> str:
+	target = _memory_safe_path(root, path)
+	text = target.read_text(encoding="utf-8")
+	count = text.count(old_str)
+	if count != 1:
+		raise ValueError("str_replace requires old_str to appear exactly once.")
+	target.write_text(text.replace(old_str, new_str), encoding="utf-8")
+	return f"Updated {path}."
+
+
+def _memory_insert(root: Path, path: str, insert_line: int, insert_text: str) -> str:
+	target = _memory_safe_path(root, path)
+	lines = target.read_text(encoding="utf-8").splitlines()
+	if insert_line < 0 or insert_line > len(lines):
+		raise ValueError("insert_line is out of range.")
+	new_lines = lines[:insert_line] + insert_text.splitlines() + lines[insert_line:]
+	target.write_text("\n".join(new_lines), encoding="utf-8")
+	return f"Inserted text into {path}."
+
+
+def _memory_delete(root: Path, path: str) -> str:
+	target = _memory_safe_path(root, path)
+	if not target.exists():
+		return f"Path not found: {path}."
+	if target.is_dir():
+		shutil.rmtree(target)
+	else:
+		target.unlink()
+	return f"Deleted {path}."
+
+
+def _memory_rename(root: Path, old_path: str, new_path: str) -> str:
+	source = _memory_safe_path(root, old_path)
+	target = _memory_safe_path(root, new_path)
+	target.parent.mkdir(parents=True, exist_ok=True)
+	source.rename(target)
+	return f"Renamed {old_path} to {new_path}."
+
+
+def _run_memory_command(command: dict[str, Any], root: Path) -> str | list[str]:
+	command_name = str(command.get("command", "")).strip().lower()
+	if command_name == "view":
+		path = str(command.get("path", ""))
+		return _memory_view(root, path)
+	if command_name == "create":
+		return _memory_create(
+			root,
+			str(command.get("path", "")),
+			str(command.get("file_text", "")),
+		)
+	if command_name == "str_replace":
+		return _memory_str_replace(
+			root,
+			str(command.get("path", "")),
+			str(command.get("old_str", "")),
+			str(command.get("new_str", "")),
+		)
+	if command_name == "insert":
+		insert_line = int(command.get("insert_line", 0))
+		insert_text = str(command.get("insert_text", ""))
+		return _memory_insert(
+			root,
+			str(command.get("path", "")),
+			insert_line,
+			insert_text,
+		)
+	if command_name == "delete":
+		return _memory_delete(root, str(command.get("path", "")))
+	if command_name == "rename":
+		return _memory_rename(
+			root,
+			str(command.get("old_path", "")),
+			str(command.get("new_path", "")),
+		)
+	if command_name == "clear_all_memory":
+		for child in root.iterdir():
+			if child.is_dir():
+				shutil.rmtree(child)
+			else:
+				child.unlink()
+		return "Cleared all memory."
+	raise ValueError(f"Unsupported memory command: {command_name or '<empty>'}")
+
+
 def setup_telemetry() -> None:
 	"""Configure OpenTelemetry export to Arize Phoenix using OTLP/HTTP."""
 	tracer_provider = TracerProvider()
@@ -481,22 +624,38 @@ def get_today(payload: GetTodayInput) -> str:
 
 
 @mcp.tool
-def fetch_url(payload: FetchUrlInput) -> FetchUrlOutput:
-	"""HTTP GET wrapper that returns status code, content-type and body."""
-	headers = {
-		"User-Agent": (
-			"Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-			"AppleWebKit/537.36 (KHTML, like Gecko) "
-			"Chrome/124.0.0.0 Safari/537.36"
-		)
-	}
-	response = requests.get(payload.url, timeout=20, headers=headers)
-	content_type = _clean_text(response.headers.get("Content-Type", ""))
-	return FetchUrlOutput(
-		status=response.status_code,
-		content_type=content_type,
-		body=response.text,
-	)
+def run_with_web_fetch_tool(payload: RunWithWebFetchInput) -> RunWithWebFetchOutput:
+	"""Run a Pydantic AI agent with provider-adaptive web fetch support."""
+	from pydantic_ai import Agent
+	from pydantic_ai.capabilities import WebFetch
+
+	# WebFetch uses provider builtin when available and local fallback otherwise (works with Mistral).
+	agent = Agent(payload.model, capabilities=[WebFetch()])
+	result = agent.run_sync(payload.prompt)
+	return RunWithWebFetchOutput(response=str(result.output))
+
+
+@mcp.tool
+def run_with_memory_tool(payload: RunWithMemoryToolInput) -> RunWithMemoryToolOutput:
+	"""Run a Pydantic AI agent with memory support, including Mistral-compatible fallback."""
+	from pydantic_ai import Agent
+
+	root = _memory_root(payload.memory_root)
+
+	if payload.model.startswith("anthropic:"):
+		from pydantic_ai import MemoryTool
+
+		agent = Agent(payload.model, builtin_tools=[MemoryTool()])
+	else:
+		# MemoryTool builtin is Anthropic-specific; for Mistral we expose only local memory tool.
+		agent = Agent(payload.model)
+
+	@agent.tool_plain
+	def memory(**command: Any) -> Any:
+		return _run_memory_command(command, root)
+
+	result = agent.run_sync(payload.prompt)
+	return RunWithMemoryToolOutput(response=str(result.output))
 
 
 @mcp.tool
