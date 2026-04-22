@@ -18,7 +18,8 @@ import re
 import shutil
 from difflib import SequenceMatcher
 from datetime import date
-from typing import Iterable, Literal
+from pathlib import Path
+from typing import Any, Iterable, Literal
 from urllib.parse import urljoin
 
 from fastmcp import FastMCP
@@ -29,6 +30,7 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from openinference.instrumentation.pydantic_ai import OpenInferenceSpanProcessor
 from pydantic import BaseModel, Field
 from bs4 import BeautifulSoup
+import requests
 
 
 mcp = FastMCP("basic-tools")
@@ -222,6 +224,199 @@ def _iter_news_candidates(soup: BeautifulSoup) -> Iterable:
 				continue
 			seen.add(node_id)
 			yield node
+
+
+def _dedupe_keep_order(values: Iterable[str]) -> list[str]:
+	seen: set[str] = set()
+	result: list[str] = []
+	for value in values:
+		clean = _clean_text(value)
+		if not clean:
+			continue
+		key = clean.lower()
+		if key in seen:
+			continue
+		seen.add(key)
+		result.append(clean)
+	return result
+
+
+def _extract_teaser_items(soup: BeautifulSoup) -> list[TeaserItem]:
+	items: list[TeaserItem] = []
+	seen: set[tuple[str, str]] = set()
+
+	for candidate in _iter_news_candidates(soup):
+		title_node = candidate.find(["h1", "h2", "h3", "h4"]) or candidate.find("a")
+		if not title_node:
+			continue
+
+		title = _clean_text(title_node.get_text(" ", strip=True))
+		if len(title) < 8:
+			continue
+
+		link_node = title_node.find("a") if title_node.name != "a" else title_node
+		if not link_node:
+			link_node = candidate.find("a", href=True)
+		url = _clean_text(link_node.get("href", "")) if link_node else ""
+
+		summary_node = candidate.find("p")
+		summary = _clean_text(summary_node.get_text(" ", strip=True)) if summary_node else ""
+		if not summary:
+			summary = title
+
+		image_node = candidate.find("img")
+		image = ""
+		if image_node:
+			image = _clean_text(
+				image_node.get("src")
+				or image_node.get("data-src")
+				or image_node.get("data-original")
+				or ""
+			)
+
+		key = (title.lower(), url)
+		if key in seen:
+			continue
+		seen.add(key)
+
+		items.append(TeaserItem(title=title, summary=summary, url=url, image=image))
+		if len(items) >= 30:
+			break
+
+	return items
+
+
+def _extract_article(soup: BeautifulSoup) -> ArticleExtractionOutput:
+	title_node = soup.select_one("article h1, main h1, h1")
+	if not title_node:
+		title_node = soup.find("title")
+	title = _clean_text(title_node.get_text(" ", strip=True)) if title_node else ""
+
+	lead_node = soup.select_one(
+		"article .lead, article p.lead, main .lead, .article-lead, .entry-summary"
+	)
+	if not lead_node:
+		lead_node = soup.select_one("article p, main p")
+	lead = _clean_text(lead_node.get_text(" ", strip=True)) if lead_node else ""
+
+	body_nodes = soup.select("article p, main p")
+	if not body_nodes:
+		body_nodes = soup.select("p")
+	body = _dedupe_keep_order(
+		[
+			_clean_text(node.get_text(" ", strip=True))
+			for node in body_nodes
+			if _clean_text(node.get_text(" ", strip=True))
+		]
+	)
+
+	image_urls = _dedupe_keep_order(
+		[
+			_clean_text(img.get("src") or img.get("data-src") or "")
+			for img in soup.select("article img, main img, img")
+		]
+	)
+
+	links = _dedupe_keep_order(
+		[_clean_text(a.get("href", "")) for a in soup.select("article a[href], main a[href], a[href]")]
+	)
+
+	return ArticleExtractionOutput(
+		title=title,
+		lead=lead,
+		body=body,
+		images=image_urls,
+		links=links,
+	)
+
+
+def _split_sentences(text: str) -> list[str]:
+	parts = re.split(r"(?<=[.!?])\s+", _clean_text(text))
+	return [part.strip() for part in parts if part.strip()]
+
+
+def _extract_entities_from_text(text: str) -> EntitiesOutput:
+	clean = _clean_text(text)
+
+	date_patterns = [
+		r"\b\d{4}-\d{2}-\d{2}\b",
+		r"\b\d{4}\.\d{1,2}\.\d{1,2}\.?\b",
+		r"\b\d{1,2}\.\d{1,2}\.\d{4}\.?\b",
+	]
+	dates = _dedupe_keep_order(
+		match for pattern in date_patterns for match in re.findall(pattern, clean)
+	)
+
+	url_pattern = r"https?://[^\s)\]>'\"]+"
+	urls = _dedupe_keep_order(re.findall(url_pattern, clean))
+
+	person_pattern = (
+		r"\b[A-ZÁÉÍÓÖŐÚÜŰ][a-záéíóöőúüű]+\s+[A-ZÁÉÍÓÖŐÚÜŰ][a-záéíóöőúüű]+\b"
+	)
+	persons = _dedupe_keep_order(re.findall(person_pattern, clean))
+
+	org_keyword_pattern = (
+		r"\b[A-ZÁÉÍÓÖŐÚÜŰ][\wÁÉÍÓÖŐÚÜŰáéíóöőúüű.-]*(?:\s+[A-ZÁÉÍÓÖŐÚÜŰ][\wÁÉÍÓÖŐÚÜŰáéíóöőúüű.-]*)*\s+"
+		r"(?:University|Egyetem|Kar|Tanszék|Intézet|Kft|Zrt|Ltd|Inc|GmbH)\b"
+	)
+	organizations = _dedupe_keep_order(re.findall(org_keyword_pattern, clean))
+
+	acronyms = _dedupe_keep_order(re.findall(r"\b[A-Z]{2,}\b", clean))
+	for acronym in acronyms:
+		if acronym not in organizations:
+			organizations.append(acronym)
+
+	event_pattern = (
+		r"\b[\wÁÉÍÓÖŐÚÜŰáéíóöőúüű\- ]{3,}"
+		r"(?:konferencia|workshop|szeminárium|seminar|meetup|hackathon|nyílt nap|verseny|előadás|fórum)\b"
+	)
+	events = _dedupe_keep_order(re.findall(event_pattern, clean, flags=re.IGNORECASE))
+
+	locations: list[str] = []
+	for match in re.findall(
+		r"\b(?:in|at|on|Budapesten|Budapesten|Budapest|Debrecenben|Szegeden|Győrben)\s+"
+		r"([A-ZÁÉÍÓÖŐÚÜŰ][\wÁÉÍÓÖŐÚÜŰáéíóöőúüű-]*(?:\s+[A-ZÁÉÍÓÖŐÚÜŰ][\wÁÉÍÓÖŐÚÜŰáéíóöőúüű-]*)*)",
+		clean,
+	):
+		locations.append(match)
+	locations = _dedupe_keep_order(locations)
+
+	return EntitiesOutput(
+		dates=dates,
+		locations=locations,
+		events=events,
+		persons=persons,
+		organizations=organizations,
+		urls=urls,
+	)
+
+
+def _summarize_text(text: str, length: str) -> str:
+	char_limits = {"short": 240, "medium": 600, "long": 1200}
+	limit = char_limits[length]
+	if len(_clean_text(text)) <= limit:
+		return _clean_text(text)
+
+	sentences = _split_sentences(text)
+	if not sentences:
+		return _clean_text(text)[: max(0, limit - 3)] + "..."
+
+	selected: list[str] = []
+	current_len = 0
+	for sentence in sentences:
+		needed = len(sentence) + (1 if selected else 0)
+		if current_len + needed > limit:
+			break
+		selected.append(sentence)
+		current_len += needed
+
+	if not selected:
+		return _clean_text(text)[: max(0, limit - 3)] + "..."
+
+	result = " ".join(selected)
+	if len(result) < len(_clean_text(text)):
+		result = result.rstrip(" .") + "..."
+	return result
 
 
 def _unique_topics(raw_topics: list[str]) -> list[str]:
