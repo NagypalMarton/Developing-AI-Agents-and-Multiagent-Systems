@@ -52,6 +52,24 @@ class FetchUrlOutput(BaseModel):
 	body: str
 
 
+class FetchUrlForAiInput(BaseModel):
+	url: str = Field(description="Target URL")
+	max_chars: int = Field(
+		default=6000,
+		ge=500,
+		le=30000,
+		description="Maximum number of cleaned text characters returned for LLM consumption",
+	)
+	timeout_seconds: int = Field(default=20, ge=5, le=60)
+
+
+class FetchUrlForAiOutput(BaseModel):
+	status: int
+	content_type: str
+	text: str
+	output: str
+
+
 class ExtractHtmlInput(BaseModel):
 	html: str = Field(description="Raw HTML document")
 	mode: Literal["teaser", "article"] = Field(
@@ -217,6 +235,14 @@ def _truncate_text(value: str, max_chars: int) -> str:
 		return value
 	kept = value[:max_chars].rstrip()
 	return f"{kept}\n\n...[truncated {len(value) - max_chars} chars]"
+
+
+def _html_to_llm_text(html: str) -> str:
+	soup = BeautifulSoup(html, "html.parser")
+	for node in soup(["script", "style", "noscript", "svg"]):
+		node.decompose()
+	text = soup.get_text("\n", strip=True)
+	return _clean_text(text)
 
 
 def _iter_news_candidates(soup: BeautifulSoup) -> Iterable:
@@ -877,6 +903,41 @@ def fetch_url(payload: FetchUrlInput) -> FetchUrlOutput:
 		status=response.status_code,
 		content_type=content_type,
 		body=body,
+	)
+
+
+@mcp.tool
+def fetch_url_for_ai(payload: FetchUrlForAiInput) -> FetchUrlForAiOutput:
+	"""Fetch a URL and return cleaned text suitable for LLM context windows."""
+	headers = {
+		"User-Agent": (
+			"Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+			"AppleWebKit/537.36 (KHTML, like Gecko) "
+			"Chrome/124.0.0.0 Safari/537.36"
+		)
+	}
+	response = requests.get(payload.url, timeout=payload.timeout_seconds, headers=headers)
+	content_type = _clean_text(response.headers.get("Content-Type", ""))
+
+	if "html" in content_type.lower():
+		text = _html_to_llm_text(response.text)
+	else:
+		text = _clean_text(response.text)
+
+	text = _truncate_text(text, payload.max_chars)
+	output = (
+		f"URL: {payload.url}\n"
+		f"STATUS: {response.status_code}\n"
+		"---\n"
+		f"CONTENT_TYPE: {content_type}\n"
+		"---\n"
+		f"{text}"
+	)
+	return FetchUrlForAiOutput(
+		status=response.status_code,
+		content_type=content_type,
+		text=text,
+		output=output,
 	)
 
 
