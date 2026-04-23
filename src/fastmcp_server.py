@@ -38,6 +38,12 @@ mcp = FastMCP("basic-tools")
 
 class FetchUrlInput(BaseModel):
 	url: str = Field(description="Target URL")
+	max_chars: int = Field(
+		default=20000,
+		ge=1000,
+		le=200000,
+		description="Maximum number of response body characters to return",
+	)
 
 
 class FetchUrlOutput(BaseModel):
@@ -204,6 +210,13 @@ class NewsBlock(BaseModel):
 
 def _clean_text(value: str) -> str:
 	return re.sub(r"\s+", " ", value).strip()
+
+
+def _truncate_text(value: str, max_chars: int) -> str:
+	if len(value) <= max_chars:
+		return value
+	kept = value[:max_chars].rstrip()
+	return f"{kept}\n\n...[truncated {len(value) - max_chars} chars]"
 
 
 def _iter_news_candidates(soup: BeautifulSoup) -> Iterable:
@@ -859,10 +872,11 @@ def fetch_url(payload: FetchUrlInput) -> FetchUrlOutput:
 	}
 	response = requests.get(payload.url, timeout=20, headers=headers)
 	content_type = _clean_text(response.headers.get("Content-Type", ""))
+	body = _truncate_text(response.text, payload.max_chars)
 	return FetchUrlOutput(
 		status=response.status_code,
 		content_type=content_type,
-		body=response.text,
+		body=body,
 	)
 
 
@@ -1063,6 +1077,11 @@ def run_phoenix_pydantic_evals(payload: RunPhoenixPydanticEvalsInput) -> RunPhoe
 
 	report = dataset.evaluate_sync(task)
 	report_data = report.model_dump()
+	compact_report = {
+		"summary": report_data.get("summary", {}),
+		"total_cases": len(report_data.get("cases", [])),
+		"note": "Raw report compacted to reduce token usage.",
+	}
 
 	case_results: list[EvalCaseResult] = []
 	exact_hits = 0
@@ -1154,7 +1173,7 @@ def run_phoenix_pydantic_evals(payload: RunPhoenixPydanticEvalsInput) -> RunPhoe
 		uploaded_annotations=uploaded_annotations,
 		notes=notes,
 		cases=case_results,
-		report=report_data,
+		report=compact_report,
 	)
 
 
