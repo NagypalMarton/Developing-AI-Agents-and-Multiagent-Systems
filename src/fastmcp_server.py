@@ -606,7 +606,7 @@ def _discover_news_event_links(soup: BeautifulSoup, root_url: str, max_links: in
 def _dedupe_news_items(items: list[CrawledNewsItem]) -> list[CrawledNewsItem]:
     deduped: dict[str, CrawledNewsItem] = {}
     for item in items:
-        key = item.url.lower()
+        key = str(item.url).lower()
         if key not in deduped:
             deduped[key] = item
     return list(deduped.values())
@@ -615,7 +615,7 @@ def _dedupe_news_items(items: list[CrawledNewsItem]) -> list[CrawledNewsItem]:
 def _dedupe_event_items(items: list[CrawledEventItem]) -> list[CrawledEventItem]:
     deduped: dict[str, CrawledEventItem] = {}
     for item in items:
-        key = item.url.lower()
+        key = str(item.url).lower()
         if key not in deduped:
             deduped[key] = item
     return list(deduped.values())
