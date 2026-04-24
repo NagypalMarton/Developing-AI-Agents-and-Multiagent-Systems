@@ -9,6 +9,7 @@ from typing import Literal
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlparse
 from urllib.request import Request, urlopen
+from zoneinfo import ZoneInfo
 
 from bs4 import BeautifulSoup
 from fastmcp import FastMCP
@@ -163,6 +164,10 @@ def _deaccent(text: str) -> str:
 
 def _normalize_for_match(text: str) -> str:
     return _deaccent(_clean_whitespace(text)).lower()
+
+
+def _today_iso(timezone_name: str = "Europe/Budapest") -> str:
+    return datetime.now(ZoneInfo(timezone_name)).date().isoformat()
 
 
 def _is_http_url(value: str) -> bool:
@@ -621,6 +626,17 @@ def _dedupe_event_items(items: list[CrawledEventItem]) -> list[CrawledEventItem]
     return list(deduped.values())
 
 
+def _filter_news_by_date(items: list[CrawledNewsItem], target_iso_date: str) -> list[CrawledNewsItem]:
+    filtered: list[CrawledNewsItem] = []
+    for item in items:
+        if not item.published_at:
+            continue
+        normalized = _normalize_hu_date_to_iso(item.published_at) or item.published_at
+        if normalized == target_iso_date:
+            filtered.append(item)
+    return filtered
+
+
 def _extract_text(soup: BeautifulSoup) -> str:
     for node in soup(["script", "style", "noscript"]):
         node.decompose()
@@ -945,9 +961,21 @@ def health() -> dict:
 
 
 @mcp.tool
+def get_current_date(timezone_name: str = "Europe/Budapest") -> dict:
+    """Return the current date in ISO format; default timezone is Europe/Budapest."""
+    now = datetime.now(ZoneInfo(timezone_name))
+    return {
+        "timezone": timezone_name,
+        "iso_date": now.date().isoformat(),
+        "iso_datetime": now.isoformat(),
+    }
+
+
+@mcp.tool
 def crawl_news_and_events_from_roots(request: CrawlRootsRequest) -> dict:
     """Crawl exactly two root URLs and collect news/event cards through discovered subpages."""
     source_results: list[SourceCrawlResult] = []
+    current_date_iso = _today_iso("Europe/Budapest")
 
     for root_url_obj in request.root_urls:
         root_url = str(root_url_obj)
@@ -1014,7 +1042,7 @@ def crawl_news_and_events_from_roots(request: CrawlRootsRequest) -> dict:
             SourceCrawlResult(
                 source_root=root_url,
                 visited_urls=visited_urls,
-                news=_dedupe_news_items(all_news),
+                news=_filter_news_by_date(_dedupe_news_items(all_news), current_date_iso),
                 events=_dedupe_event_items(all_events),
                 errors=errors,
             )
@@ -1025,6 +1053,7 @@ def crawl_news_and_events_from_roots(request: CrawlRootsRequest) -> dict:
 
     return {
         "language": request.language,
+        "current_date": current_date_iso,
         "sources": [result.model_dump(mode="json") for result in source_results],
         "summary": {
             "source_count": len(source_results),
