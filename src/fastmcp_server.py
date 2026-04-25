@@ -5,7 +5,6 @@ import re
 import unicodedata
 from datetime import datetime
 from html import unescape
-from typing import Literal
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlparse
 from urllib.request import Request, urlopen
@@ -23,10 +22,6 @@ mcp = FastMCP(
         "platform-specific social media content generation for n8n workflows."
     ),
 )
-
-
-PlatformName = Literal["linkedin", "facebook", "x"]
-DEFAULT_PLATFORMS: tuple[PlatformName, PlatformName, PlatformName] = ("linkedin", "facebook", "x")
 
 
 class NewsIngestRequest(BaseModel):
@@ -56,29 +51,6 @@ class NewsArticle(BaseModel):
     language: str = "hu"
     tags: list[str] = Field(default_factory=list)
     events: list[NewsEvent] = Field(default_factory=list)
-
-
-class GenerationOptions(BaseModel):
-    include_event_cta: bool = True
-    hashtag_limit: int = Field(default=3, ge=0, le=8)
-
-
-class GeneratePostsRequest(BaseModel):
-    article: NewsArticle
-    platforms: list[PlatformName] = Field(default_factory=lambda: list(DEFAULT_PLATFORMS))
-    options: GenerationOptions = Field(default_factory=GenerationOptions)
-
-
-class PlatformPost(BaseModel):
-    platform: PlatformName
-    text: str
-    char_count: int
-    truncated: bool
-
-
-class PromptPack(BaseModel):
-    platform: PlatformName
-    prompt: str
 
 
 class CrawlRootsRequest(BaseModel):
@@ -773,110 +745,6 @@ def _detect_events(text: str, registration_urls: list[str] | None = None) -> lis
     return list(deduped.values())[:5]
 
 
-def _to_hashtags(tags: list[str], limit: int) -> str:
-    selected: list[str] = []
-    for tag in tags:
-        candidate = re.sub(r"[^a-zA-Z0-9_\-]", "", tag.replace(" ", ""))
-        if not candidate:
-            continue
-        selected.append(f"#{candidate}")
-        if len(selected) >= limit:
-            break
-    return " ".join(selected)
-
-
-def _ensure_char_limit(text: str, max_chars: int) -> tuple[str, bool]:
-    if len(text) <= max_chars:
-        return text, False
-
-    trimmed = text[: max_chars - 3].rstrip()
-    if " " in trimmed:
-        trimmed = trimmed.rsplit(" ", 1)[0]
-    return trimmed + "...", True
-
-
-def _build_event_cta(events: list[NewsEvent]) -> str:
-    if not events:
-        return ""
-
-    primary = events[0]
-    if primary.registration_url:
-        return f"\nJelentkezes: {primary.registration_url}"
-
-    return "\nCsatlakozz az esemenyhez, es oszd meg a hiret!"
-
-
-def _platform_limit(platform: PlatformName) -> int:
-    return {
-        "linkedin": 1100,
-        "facebook": 1800,
-        "x": 280,
-    }[platform]
-
-
-def _platform_header(platform: PlatformName) -> str:
-    return {
-        "linkedin": "Szakmai frissites",
-        "facebook": "Friss tanszeki hir",
-        "x": "Uj hir",
-    }[platform]
-
-
-def _build_post_text(article: NewsArticle, platform: PlatformName, options: GenerationOptions) -> str:
-    summary_base = article.lead or article.body_text[:240]
-    summary_base = _clean_whitespace(summary_base)
-
-    url_line = f"\nForras: {article.source_url}" if article.source_url else ""
-    hashtags = _to_hashtags(article.tags, options.hashtag_limit)
-    hashtags_line = f"\n\n{hashtags}" if hashtags else ""
-
-    event_cta = ""
-    if options.include_event_cta and article.events:
-        event_cta = _build_event_cta(article.events)
-
-    header = _platform_header(platform)
-
-    if platform == "x":
-        return f"{header}: {article.title}. {summary_base}{event_cta}{hashtags_line}"
-
-    return (
-        f"{header}\n\n"
-        f"{article.title}\n"
-        f"{summary_base}"
-        f"{event_cta}"
-        f"{url_line}"
-        f"{hashtags_line}"
-    )
-
-
-def _prompt_for_platform(article: NewsArticle, platform: PlatformName, include_event_cta: bool) -> str:
-    platform_rules = {
-        "linkedin": "professional tone, 3-5 short paragraphs, clear call-to-action",
-        "facebook": "accessible and engaging tone, 1-3 emojis optional, concise community focus",
-        "x": "single concise post under 280 characters",
-    }[platform]
-
-    event_instructions = ""
-    if include_event_cta and article.events:
-        first_event = article.events[0]
-        event_instructions = (
-            "\nIf the article references an event, include a registration call-to-action."
-            f" Event data: {first_event.model_dump_json()}"
-        )
-
-    return (
-        "You are a social media editor for a university department. "
-        f"Rewrite the news for {platform}. Follow these platform rules: {platform_rules}."
-        f"\nTitle: {article.title}"
-        f"\nLead: {article.lead}"
-        f"\nBody: {article.body_text[:1600]}"
-        f"\nTags: {article.tags}"
-        f"\nLanguage: {article.language}"
-        f"{event_instructions}"
-        "\nReturn only the final post text."
-    )
-
-
 @mcp.tool
 def parse_news_html(request: NewsIngestRequest) -> dict:
     """Parse raw HTML news into a structured article model with detected events."""
@@ -901,63 +769,6 @@ def detect_events(article_text: str, registration_urls: list[str] | None = None)
     """Detect event candidates from article text and optional registration URLs."""
     events = _detect_events(article_text, registration_urls)
     return [event.model_dump(mode="json") for event in events]
-
-
-@mcp.tool
-def generate_platform_posts(request: GeneratePostsRequest) -> list[dict]:
-    """Generate platform-specific draft posts with optional event registration CTA insertion."""
-    outputs: list[PlatformPost] = []
-
-    for platform in request.platforms:
-        raw_text = _build_post_text(request.article, platform, request.options)
-        limited_text, truncated = _ensure_char_limit(raw_text, _platform_limit(platform))
-        outputs.append(
-            PlatformPost(
-                platform=platform,
-                text=limited_text,
-                char_count=len(limited_text),
-                truncated=truncated,
-            )
-        )
-
-    return [output.model_dump(mode="json") for output in outputs]
-
-
-@mcp.tool
-def build_llm_prompt_pack(article: NewsArticle, include_event_cta: bool = True) -> list[dict]:
-    """Build platform-specific prompts for external LLM nodes in n8n."""
-    packs = [
-        PromptPack(
-            platform=platform,
-            prompt=_prompt_for_platform(article, platform, include_event_cta),
-        )
-        for platform in DEFAULT_PLATFORMS
-    ]
-    return [pack.model_dump(mode="json") for pack in packs]
-
-
-@mcp.tool
-def news_workflow_bundle(request: GeneratePostsRequest) -> dict:
-    """Return a single n8n-friendly bundle with generated posts and LLM prompt pack."""
-    posts = generate_platform_posts(request)
-    prompts = build_llm_prompt_pack(request.article, request.options.include_event_cta)
-
-    return {
-        "generated_at": datetime.utcnow().isoformat() + "Z",
-        "article": request.article.model_dump(mode="json"),
-        "posts": posts,
-        "prompt_pack": prompts,
-    }
-
-
-@mcp.tool
-def health() -> dict:
-    """Simple health endpoint for workflow diagnostics."""
-    return {
-        "status": "ok",
-        "service": "news-content-mcp",
-        "time_utc": datetime.utcnow().isoformat() + "Z",
-    }
 
 
 @mcp.tool

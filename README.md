@@ -40,26 +40,14 @@ Az `src/fastmcp_server.py` szerver a következő, n8n-ből hívható MCP tooloka
 - `detect_events`
   - Bemenet: cikk szöveg + opcionális regisztrációs linkek
   - Kimenet: detektált eseménylista (`name`, `start_date`, `location`, `registration_url`)
-- `generate_platform_posts`
-  - Bemenet: strukturált cikk + platformok (`linkedin`, `facebook`, `x`)
-  - Kimenet: platform-specifikus draft posztok karakterlimittel
-- `build_llm_prompt_pack`
-  - Bemenet: strukturált cikk
-  - Kimenet: platform-specifikus promptok külső LLM node-okhoz
-- `news_workflow_bundle`
-  - Bemenet: strukturált cikk + opciók
-  - Kimenet: egyben cikk + draft posztok + LLM prompt pack (`n8n`-barát bundle)
-- `health`
-  - Egyszerű állapotellenőrzés
 
 ### 2.2) Javasolt n8n feldolgozási lánc
 
 1. HTML betöltése (pl. HTTP Request)
 2. `crawl_news_and_events_from_roots` (2 kezdő URL-ről közvetett begyűjtés)
 3. cikkenként `parse_news_html` (ha részletes feldolgozás kell)
-4. `generate_platform_posts` (vagy `news_workflow_bundle`)
-5. opcionálisan `build_llm_prompt_pack` + LLM node finomátírás
-6. platformonként publikálás (LinkedIn/Facebook/X node-ok)
+4. események kinyerése `detect_events` segítségével
+5. opcionális saját LLM lépés külső node-ban
 
 Megjegyzés: a jelenlegi parser a BME eseménykártya mintákat kezeli,TMIT tanszéki oldalon külön esemény HTML-minta hiányában ott csak hírek kerülnek kigyűjtésre.
 
