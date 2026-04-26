@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 import re
 from typing import Literal
@@ -45,14 +44,6 @@ class UrlDiscoveryInput(BaseModel):
         default=None,
         description="Relativ URL-ek feloldasahoz hasznalt bazis URL.",
     )
-    news_keywords: list[str] = Field(
-        default_factory=lambda: DEFAULT_NEWS_KEYWORDS.copy(),
-        description="Kulcsszavak a hir linkek felismeresehez.",
-    )
-    event_keywords: list[str] = Field(
-        default_factory=lambda: DEFAULT_EVENT_KEYWORDS.copy(),
-        description="Kulcsszavak az esemeny linkek felismeresehez.",
-    )
 
     @model_validator(mode="after")
     def validate_source(self) -> "UrlDiscoveryInput":
@@ -64,33 +55,74 @@ class UrlDiscoveryInput(BaseModel):
 class UrlDiscoveryResult(BaseModel):
     source_url: HttpUrl | None
     total_links_scanned: int
-    news_urls: list[HttpUrl]
-    event_urls: list[HttpUrl]
+    discovered_urls: list[HttpUrl]
 
 
-class PageExtractionInput(BaseModel):
-    urls: list[HttpUrl] = Field(description="Feldolgozando oldalak URL-jei.")
+class UrlSummarizeInput(BaseModel):
+    detected_pages: list["DetectedPage"] = Field(
+        description="A discover_text_and_detection_from_url tool kimenete.")
     max_items: int = Field(default=10, ge=1, le=100)
     summary_sentence_count: int = Field(default=3, ge=1, le=10)
 
 
-class PageItem(BaseModel):
+class UrlTextDetectionInput(BaseModel):
+    urls: list[HttpUrl] = Field(description="Feldolgozando oldalak URL-jei.")
+    max_items: int = Field(default=20, ge=1, le=200)
+    news_keywords: list[str] = Field(
+        default_factory=lambda: DEFAULT_NEWS_KEYWORDS.copy(),
+        description="Kulcsszavak a hir tartalmak felismeresehez.",
+    )
+    event_keywords: list[str] = Field(
+        default_factory=lambda: DEFAULT_EVENT_KEYWORDS.copy(),
+        description="Kulcsszavak az esemeny tartalmak felismeresehez.",
+    )
+
+
+class DetectedPage(BaseModel):
     source_url: HttpUrl
-    source_unit: Literal["BME", "tmit", "aut", "ttk", "other"]
-    item_type: Literal["news", "event"]
-    title: str
-    content: str
+    detected_type: Literal["news", "event", "unknown"]
+    detected_title: str
+    detected_author: str | None = None
+    detected_text: str
+    detected_datetime: str | None = None
+    detected_location: str | None = None
+    detected_guests_list: list[str] = Field(default_factory=list)
+    detected_registration: HttpUrl | None = None
 
 
-class PageBatchResult(BaseModel):
+class UrlTextDetectionResult(BaseModel):
     processed_count: int
-    page_items: list[PageItem]
+    detected_pages: list[DetectedPage]
     errors: list[str]
 
 
-LLM_MODEL_ENV = "NEWS_EVENTS_LLM_MODEL"
-LLM_BASE_URL_ENV = "NEWS_EVENTS_LLM_BASE_URL"
-LLM_API_KEY_ENV = "NEWS_EVENTS_LLM_API_KEY"
+class NewsItem(BaseModel):
+    news_title: str
+    news_auther: str
+    news_content: str
+    news_url: HttpUrl
+    news_image: HttpUrl | None = None
+
+
+class NewsBatchResult(BaseModel):
+    processed_count: int
+    news_items: list[NewsItem]
+    errors: list[str]
+
+
+class EventItem(BaseModel):
+    events_title: str
+    events_datetime: str
+    events_location: str
+    events_description: str
+    events_guests_list: list[str]
+    events_registration: HttpUrl | None = None
+
+
+class EventBatchResult(BaseModel):
+    processed_count: int
+    events_items: list[EventItem]
+    errors: list[str]
 
 
 def _fetch_html(url: str, timeout: int = 15) -> str:
@@ -153,6 +185,39 @@ def _classify_link(url: str, anchor_text: str, news_keywords: list[str], event_k
     return None
 
 
+def _classify_page_content(
+    url: str,
+    title: str | None,
+    text: str | None,
+    news_keywords: list[str],
+    event_keywords: list[str],
+) -> Literal["news", "event", "unknown"]:
+    text_sample = (text or "")[:4000]
+    haystack = f"{url} {title or ''} {text_sample}".lower()
+
+    event_score = sum(1 for keyword in event_keywords if keyword.lower() in haystack)
+    news_score = sum(1 for keyword in news_keywords if keyword.lower() in haystack)
+
+    if event_score > news_score and event_score > 0:
+        return "event"
+
+    if news_score > event_score and news_score > 0:
+        return "news"
+
+    tie_breaker = _classify_link(
+        url=url,
+        anchor_text=title or "",
+        news_keywords=news_keywords,
+        event_keywords=event_keywords,
+    )
+    if tie_breaker == "news":
+        return "news"
+    if tie_breaker == "event":
+        return "event"
+
+    return "unknown"
+
+
 def _extract_main_text(soup: BeautifulSoup) -> str | None:
     candidates = [
         soup.find("article"),
@@ -189,18 +254,6 @@ def _extract_title(soup: BeautifulSoup) -> str | None:
 
     if soup.title and soup.title.get_text(strip=True):
         return soup.title.get_text(" ", strip=True)
-
-    return None
-
-
-def _extract_image_url(soup: BeautifulSoup, page_url: str) -> str | None:
-    og_image = soup.find("meta", attrs={"property": "og:image"})
-    if og_image and og_image.get("content"):
-        return urljoin(page_url, og_image["content"].strip())
-
-    first_image = soup.find("img")
-    if first_image and first_image.get("src"):
-        return urljoin(page_url, first_image["src"].strip())
 
     return None
 
@@ -319,110 +372,6 @@ def _make_summary(text: str | None, max_sentences: int) -> str | None:
     return " ".join(sentences[:max_sentences])
 
 
-def _infer_source_unit(url: str, soup: BeautifulSoup) -> Literal["BME", "tmit", "aut", "ttk", "other"]:
-    url_haystack = f"{url} {urlparse(url).netloc} {urlparse(url).path}".lower()
-    page_text = soup.get_text(" ", strip=True).lower()
-    haystack = f"{url_haystack} {page_text[:4000]}"
-
-    if "bme" in haystack:
-        return "BME"
-    if "tmit" in haystack:
-        return "tmit"
-    if "aut" in haystack:
-        return "aut"
-    if "ttk" in haystack:
-        return "ttk"
-    return "other"
-
-
-def _build_llm_prompt(url: str, title: str | None, content: str | None, source_unit: str) -> str:
-    return (
-        "Döntsd el, hogy az alábbi oldal hírt vagy eseményt ír le. "
-        "Csak JSON-t adj vissza, pontosan ebben a formában: {\"item_type\": \"news\"|\"event\"}. "
-        "Ha bizonytalan vagy, az oldal eseménynek számítson csak akkor, ha programot, időpontot, helyszínt vagy regisztrációt tartalmaz. "
-        f"Forrás URL: {url}\n"
-        f"Forrás egység: {source_unit}\n"
-        f"Cím: {title or 'N/A'}\n"
-        f"Kinyert tartalom: {content or 'N/A'}"
-    )
-
-
-def _classify_page_with_llm(url: str, title: str | None, content: str | None, source_unit: str) -> Literal["news", "event"]:
-    model_name = os.getenv(LLM_MODEL_ENV, "")
-    if not model_name:
-        raise RuntimeError(
-            f"Hiányzik az LLM modell konfigurációja. Állítsd be a {LLM_MODEL_ENV} környezeti változót."
-        )
-
-    base_url = os.getenv(LLM_BASE_URL_ENV)
-    api_key = os.getenv(LLM_API_KEY_ENV)
-    if not base_url and model_name.startswith("openai:"):
-        base_url = "https://api.openai.com/v1"
-
-    if not base_url:
-        raise RuntimeError(
-            f"Hiányzik az LLM base URL konfigurációja. Állítsd be a {LLM_BASE_URL_ENV} környezeti változót."
-        )
-
-    prompt = _build_llm_prompt(url=url, title=title, content=content, source_unit=source_unit)
-    payload = {
-        "model": model_name.replace("openai:", ""),
-        "messages": [
-            {
-                "role": "system",
-                "content": "Te egy szigorú osztályozó vagy. Csak érvényes JSON-t adj vissza.",
-            },
-            {"role": "user", "content": prompt},
-        ],
-        "temperature": 0,
-        "response_format": {"type": "json_object"},
-    }
-
-    headers = {"Content-Type": "application/json"}
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
-
-    response = requests.post(
-        f"{base_url.rstrip('/')}/chat/completions",
-        headers=headers,
-        json=payload,
-        timeout=30,
-    )
-    response.raise_for_status()
-    response_json = response.json()
-
-    try:
-        message_content = response_json["choices"][0]["message"]["content"]
-        parsed = json.loads(message_content)
-        item_type = parsed.get("item_type")
-    except Exception as exc:  # noqa: BLE001
-        raise RuntimeError(f"Nem sikerült LLM választ JSON-ként értelmezni: {exc}") from exc
-
-    if item_type not in {"news", "event"}:
-        raise RuntimeError(f"Az LLM érvénytelen item_type értéket adott vissza: {item_type!r}")
-
-    return item_type
-
-
-def _extract_page_item_from_url(url: str, sentence_count: int) -> PageItem:
-    html = _fetch_html(url)
-    soup = _parse_html(html)
-
-    title = _extract_title(soup)
-    text = _extract_main_text(soup)
-    summary = _make_summary(text, sentence_count) or text
-    source_unit = _infer_source_unit(url, soup)
-    item_type = _classify_page_with_llm(url=url, title=title, content=summary, source_unit=source_unit)
-
-    return PageItem(
-        source_url=url,
-        source_unit=source_unit,
-        item_type=item_type,
-        title=title or "N/A",
-        content=summary or "N/A",
-    )
-
-
 def _discover_urls(payload: UrlDiscoveryInput) -> UrlDiscoveryResult:
     html = payload.html_content
     if payload.page_url:
@@ -435,8 +384,7 @@ def _discover_urls(payload: UrlDiscoveryInput) -> UrlDiscoveryResult:
     soup = _parse_html(html)
 
     scanned_links = 0
-    news_urls: list[str] = []
-    event_urls: list[str] = []
+    discovered_urls: list[str] = []
 
     for a_tag in soup.find_all("a"):
         scanned_links += 1
@@ -444,48 +392,119 @@ def _discover_urls(payload: UrlDiscoveryInput) -> UrlDiscoveryResult:
         absolute_url = _normalize_url(href, base)
         if not absolute_url:
             continue
+        discovered_urls.append(absolute_url)
 
-        anchor_text = a_tag.get_text(" ", strip=True)
-        classification = _classify_link(
-            url=absolute_url,
-            anchor_text=anchor_text,
-            news_keywords=payload.news_keywords,
-            event_keywords=payload.event_keywords,
-        )
-
-        if classification == "news":
-            news_urls.append(absolute_url)
-
-        if classification == "event":
-            event_urls.append(absolute_url)
-
-    unique_news = sorted(set(news_urls))
-    unique_events = sorted(set(event_urls))
+    unique_urls = sorted(set(discovered_urls))
 
     return UrlDiscoveryResult(
         source_url=payload.page_url,
         total_links_scanned=scanned_links,
-        news_urls=unique_news,
-        event_urls=unique_events,
+        discovered_urls=unique_urls,
     )
 
 
-def _extract_pages(payload: PageExtractionInput) -> PageBatchResult:
+def _discover_text_and_detection(payload: UrlTextDetectionInput) -> UrlTextDetectionResult:
     selected = payload.urls[: payload.max_items]
 
-    page_items: list[PageItem] = []
+    detected_pages: list[DetectedPage] = []
     errors: list[str] = []
 
     for url in selected:
+        url_str = str(url)
         try:
-            item = _extract_page_item_from_url(str(url), sentence_count=payload.summary_sentence_count)
-            page_items.append(item)
+            html = _fetch_html(url_str)
+            soup = _parse_html(html)
+
+            title = _extract_title(soup) or "N/A"
+            text = _extract_main_text(soup) or ""
+            author = _extract_author(soup)
+            event_datetime = _extract_event_datetime(soup)
+            event_location = _extract_event_location(soup)
+            event_guests = _extract_event_guests(soup)
+            registration = _extract_event_registration(soup, page_url=url_str)
+
+            detected_type = _classify_page_content(
+                url=url_str,
+                title=title,
+                text=text,
+                news_keywords=payload.news_keywords,
+                event_keywords=payload.event_keywords,
+            )
+
+            detected_pages.append(
+                DetectedPage(
+                    source_url=url,
+                    detected_type=detected_type,
+                    detected_title=title,
+                    detected_author=author,
+                    detected_text=text,
+                    detected_datetime=event_datetime,
+                    detected_location=event_location,
+                    detected_guests_list=event_guests,
+                    detected_registration=registration,
+                )
+            )
         except Exception as exc:  # noqa: BLE001
             errors.append(f"{url} -> {exc}")
 
-    return PageBatchResult(
-        processed_count=len(page_items),
-        page_items=page_items,
+    return UrlTextDetectionResult(
+        processed_count=len(detected_pages),
+        detected_pages=detected_pages,
+        errors=errors,
+    )
+
+
+def _summarize_news_urls(payload: UrlSummarizeInput) -> NewsBatchResult:
+    selected = [page for page in payload.detected_pages if page.detected_type == "news"][: payload.max_items]
+
+    news_items: list[NewsItem] = []
+    errors: list[str] = []
+
+    for page in selected:
+        try:
+            summary = _make_summary(page.detected_text, payload.summary_sentence_count) or page.detected_text
+            item = NewsItem(
+                news_title=page.detected_title or "N/A",
+                news_auther=page.detected_author or "N/A",
+                news_content=summary or "N/A",
+                news_url=page.source_url,
+                news_image=None,
+            )
+            news_items.append(item)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{page.source_url} -> {exc}")
+
+    return NewsBatchResult(
+        processed_count=len(news_items),
+        news_items=news_items,
+        errors=errors,
+    )
+
+
+def _summarize_event_urls(payload: UrlSummarizeInput) -> EventBatchResult:
+    selected = [page for page in payload.detected_pages if page.detected_type == "event"][: payload.max_items]
+
+    events_items: list[EventItem] = []
+    errors: list[str] = []
+
+    for page in selected:
+        try:
+            summary = _make_summary(page.detected_text, payload.summary_sentence_count) or page.detected_text
+            item = EventItem(
+                events_title=page.detected_title or "N/A",
+                events_datetime=page.detected_datetime or "N/A",
+                events_location=page.detected_location or "N/A",
+                events_description=summary or "N/A",
+                events_guests_list=page.detected_guests_list,
+                events_registration=page.detected_registration,
+            )
+            events_items.append(item)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{page.source_url} -> {exc}")
+
+    return EventBatchResult(
+        processed_count=len(events_items),
+        events_items=events_items,
         errors=errors,
     )
 
@@ -495,14 +514,26 @@ mcp = FastMCP(name="NewsEventsAgent")
 
 @mcp.tool()
 def discover_news_event_urls(input_data: UrlDiscoveryInput) -> UrlDiscoveryResult:
-    """HTML oldalon hir es esemeny URL-ek kigyujtese."""
+    """HTML oldalon URL-ek kigyujtese osztalyozas nelkul."""
     return _discover_urls(input_data)
 
 
 @mcp.tool()
-def extract_page_content(input_data: PageExtractionInput) -> PageBatchResult:
-    """Oldalak letoltese, tartalomkinyerese, BME/tanszek besorolas es LLM-alapu hír/esemény címkézés."""
-    return _extract_pages(input_data)
+def discover_text_and_detection_from_url(input_data: UrlTextDetectionInput) -> UrlTextDetectionResult:
+    """URL-ekrol szovegkinyeres es besorolas (hir, esemeny, unknown)."""
+    return _discover_text_and_detection(input_data)
+
+
+@mcp.tool()
+def summarize_news_urls(input_data: UrlSummarizeInput) -> NewsBatchResult:
+    """Hir URL-ek letoltese, tartalomkinyerese es rovid osszefoglalasa."""
+    return _summarize_news_urls(input_data)
+
+
+@mcp.tool()
+def summarize_event_urls(input_data: UrlSummarizeInput) -> EventBatchResult:
+    """Esemeny URL-ek letoltese, tartalomkinyerese es rovid osszefoglalasa."""
+    return _summarize_event_urls(input_data)
 
 
 if __name__ == "__main__":
