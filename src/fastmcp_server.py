@@ -6,7 +6,7 @@ from typing import Literal
 from urllib.parse import urljoin, urlparse
 
 import requests
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, FeatureNotFound
 from fastmcp import FastMCP
 from pydantic import BaseModel, Field, HttpUrl, model_validator
 
@@ -87,6 +87,14 @@ def _fetch_html(url: str, timeout: int = 15) -> str:
     )
     response.raise_for_status()
     return response.text
+
+
+def _parse_html(html: str) -> BeautifulSoup:
+    try:
+        return BeautifulSoup(html, "lxml")
+    except FeatureNotFound:
+        # Fallback keeps tools working even if lxml is unavailable.
+        return BeautifulSoup(html, "html.parser")
 
 
 def _normalize_url(href: str | None, base_url: str | None) -> str | None:
@@ -175,7 +183,7 @@ def _make_summary(text: str | None, max_sentences: int) -> str | None:
 
 def _extract_item_from_url(url: str, kind: Literal["news", "event"], sentence_count: int) -> ContentItem:
     html = _fetch_html(url)
-    soup = BeautifulSoup(html, "lxml")
+    soup = _parse_html(html)
 
     title = _extract_title(soup)
     text = _extract_main_text(soup)
@@ -201,7 +209,7 @@ def _discover_urls(payload: UrlDiscoveryInput) -> UrlDiscoveryResult:
         raise ValueError("Nem talalhato HTML tartalom a feldolgozashoz.")
 
     base = str(payload.base_url or payload.page_url) if (payload.base_url or payload.page_url) else None
-    soup = BeautifulSoup(html, "lxml")
+    soup = _parse_html(html)
 
     scanned_links = 0
     news_urls: list[str] = []

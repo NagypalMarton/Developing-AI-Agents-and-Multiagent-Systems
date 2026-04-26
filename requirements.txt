@@ -1,6 +1,7 @@
 fastmcp
 pydantic
 beautifulsoup4
+lxml
 openinference-instrumentation-pydantic-ai
 pydantic-ai
 opentelemetry-sdk
