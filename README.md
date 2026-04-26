@@ -14,7 +14,7 @@ docker compose up --build
 Elérhető szolgáltatások:
 
 - n8n UI: `http://localhost:5678`
-- FastMCP endpoint: `http://localhost:8000/mcp` (vagy a `FASTMCP_HOST_PORT` értéke szerint)
+- FastMCP endpoint: `http://localhost:8001/mcp` (vagy a `FASTMCP_HOST_PORT` értéke szerint)
 
 ### 2) n8n MCP Client beállítás
 
@@ -24,7 +24,7 @@ Ha az n8n és a FastMCP ugyanabban a `docker-compose` hálózatban fut:
 
 Ha nem konténerből, hanem host gépről hívod az MCP szervert:
 
-- MCP szerver URL: `http://localhost:8000/mcp`
+- MCP szerver URL: `http://localhost:8001/mcp`
 
 ### 2.1) Elérhető MCP toolok a hírfeldolgozó workflow-hoz
 
