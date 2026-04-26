@@ -68,14 +68,10 @@ class UrlDiscoveryResult(BaseModel):
     event_urls: list[HttpUrl]
 
 
-class UrlSummarizeInput(BaseModel):
+class PageExtractionInput(BaseModel):
     urls: list[HttpUrl] = Field(description="Feldolgozando oldalak URL-jei.")
     max_items: int = Field(default=10, ge=1, le=100)
     summary_sentence_count: int = Field(default=3, ge=1, le=10)
-
-
-class PageClassificationPayload(BaseModel):
-    item_type: Literal["news", "event"]
 
 
 class PageItem(BaseModel):
@@ -474,7 +470,7 @@ def _discover_urls(payload: UrlDiscoveryInput) -> UrlDiscoveryResult:
     )
 
 
-def _extract_pages(payload: UrlSummarizeInput) -> PageBatchResult:
+def _extract_pages(payload: PageExtractionInput) -> PageBatchResult:
     selected = payload.urls[: payload.max_items]
 
     page_items: list[PageItem] = []
@@ -504,7 +500,7 @@ def discover_news_event_urls(input_data: UrlDiscoveryInput) -> UrlDiscoveryResul
 
 
 @mcp.tool()
-def extract_page_content(input_data: UrlSummarizeInput) -> PageBatchResult:
+def extract_page_content(input_data: PageExtractionInput) -> PageBatchResult:
     """Oldalak letoltese, tartalomkinyerese, BME/tanszek besorolas es LLM-alapu hír/esemény címkézés."""
     return _extract_pages(input_data)
 

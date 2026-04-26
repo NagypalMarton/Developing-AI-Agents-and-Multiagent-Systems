@@ -26,30 +26,27 @@ Ha nem konténerből, hanem host gépről hívod az MCP szervert:
 
 - MCP szerver URL: `http://localhost:8001/mcp`
 
-### 2.1) Elérhető MCP toolok a hírfeldolgozó workflow-hoz
+### 2.1) Elérhető MCP toolok
 
 Az `src/fastmcp_server.py` szerver a következő, n8n-ből hívható MCP toolokat adja:
 
-- `parse_news_html`
-  - Bemenet: HTML forrás (`html`), opcionális `source_url`, `language`
-  - Kimenet: strukturált cikk (`title`, `lead`, `body_text`, `tags`, `events`)
-- `crawl_news_and_events_from_roots`
-  - Bemenet: pontosan 2 db gyökér URL (`root_urls`), pl. egyetemi és tanszéki kezdőoldal
-  - Működés: a gyökéroldalakról hírek/események linkjeit felderíti, majd ezeket bejárva gyűjti a BME kártyás elemeket és a tanszéki `article.node-hir` hírblokkokat
-  - Kimenet: forrásonként `news`, `events`, `visited_urls`, `errors` + összesített statisztika
-- `detect_events`
-  - Bemenet: cikk szöveg + opcionális regisztrációs linkek
-  - Kimenet: detektált eseménylista (`name`, `start_date`, `location`, `registration_url`)
+- `discover_news_event_urls`
+  - Bemenet: HTML forrás (`html_content`) vagy letöltendő oldal (`page_url`), opcionális `base_url`
+  - Működés: az oldalon lévő `<a>` linkeket kigyűjti, normalizálja, és kulcsszavak alapján hírekre vagy eseményekre bontja
+  - Kimenet: `news_urls`, `event_urls`, `total_links_scanned`
+- `extract_page_content`
+  - Bemenet: feldolgozandó URL-ek (`urls`), opcionális `max_items`, `summary_sentence_count`
+  - Működés: az oldalakat letölti, a fő szöveget kinyeri, a forrást BME/tmit/aut/ttk/other szerint besorolja, majd az LLM dönti el, hogy az adott oldal `news` vagy `event`
+  - Kimenet: `page_items`, ahol minden elem tartalmazza a forrás URL-t, a forrás egységet, a típust és a kinyert tartalmat
+
+A második tool LLM-konfigurációt igényel: állítsd be a `NEWS_EVENTS_LLM_MODEL` változót, és ha nem OpenAI-alapú végpontot használsz, a `NEWS_EVENTS_LLM_BASE_URL` értékét is.
 
 ### 2.2) Javasolt n8n feldolgozási lánc
 
 1. HTML betöltése (pl. HTTP Request)
-2. `crawl_news_and_events_from_roots` (2 kezdő URL-ről közvetett begyűjtés)
-3. cikkenként `parse_news_html` (ha részletes feldolgozás kell)
-4. események kinyerése `detect_events` segítségével
-5. opcionális saját LLM lépés külső node-ban
-
-Megjegyzés: a jelenlegi parser a BME eseménykártya mintákat kezeli,TMIT tanszéki oldalon külön esemény HTML-minta hiányában ott csak hírek kerülnek kigyűjtésre.
+2. `discover_news_event_urls` a gyűjtőoldalon
+3. `extract_page_content` a kiválasztott URL-ekre
+4. opcionális további LLM vagy szűrési lépések külső node-ban
 
 ### 3) Leállítás
 
