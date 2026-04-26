@@ -5,7 +5,7 @@ services:
       dockerfile: Dockerfile
     container_name: fastmcp-server
     ports:
-      - "${FASTMCP_HOST_PORT:-8001}:8000"
+      - "${FASTMCP_HOST_PORT:-8000}:8000"
     environment:
       - PHOENIX_COLLECTOR_ENDPOINT=http://phoenix:6006
       # Optional: set this if Phoenix auth is enabled.

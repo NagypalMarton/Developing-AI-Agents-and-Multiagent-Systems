@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 from typing import Literal
 from urllib.parse import urljoin, urlparse
@@ -274,4 +275,13 @@ def summarize_event_urls(input_data: UrlSummarizeInput) -> ContentBatchResult:
 
 
 if __name__ == "__main__":
-    mcp.run()
+    host = os.getenv("FASTMCP_HOST", "0.0.0.0")
+    port = int(os.getenv("FASTMCP_PORT", "8000"))
+    path = os.getenv("FASTMCP_PATH", "/mcp")
+
+    mcp.run(
+        transport="streamable-http",
+        host=host,
+        port=port,
+        path=path,
+    )
