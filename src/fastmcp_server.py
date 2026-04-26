@@ -2,904 +2,377 @@ from __future__ import annotations
 
 import argparse
 import re
-import unicodedata
-from datetime import datetime
+from dataclasses import dataclass
 from html import unescape
-from urllib.error import HTTPError, URLError
-from urllib.parse import urljoin, urlparse
+from typing import Literal
+from urllib.parse import urljoin
 from urllib.request import Request, urlopen
-from zoneinfo import ZoneInfo
 
 from bs4 import BeautifulSoup
 from fastmcp import FastMCP
 from pydantic import BaseModel, Field, HttpUrl
 
 
-mcp = FastMCP(
-    name="news-content-mcp",
-    instructions=(
-        "MCP server for AI-assisted university news processing and "
-        "platform-specific social media content generation for n8n workflows."
-    ),
-)
+mcp = FastMCP("news-events-agent")
 
 
-class NewsIngestRequest(BaseModel):
-    html: str = Field(..., description="Full HTML source of a news page")
-    source_url: HttpUrl | None = Field(
-        default=None,
-        description="Optional canonical source URL of the news article",
-    )
-    language: str = Field(default="hu", description="Primary language code")
+NEWS_KEYWORDS = {
+	"news",
+	"hir",
+	"article",
+	"aktualis",
+	"blog",
+	"post",
+	"announcement",
+	"announcements",
+}
+
+EVENT_KEYWORDS = {
+	"event",
+	"events",
+	"esemeny",
+	"esemenyek",
+	"calendar",
+	"program",
+	"conference",
+	"workshop",
+	"meetup",
+	"webinar",
+}
 
 
-class NewsEvent(BaseModel):
-    name: str
-    start_date: str | None = None
-    location: str | None = None
-    registration_url: HttpUrl | None = None
-    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
-    evidence: str | None = None
+class UrlExtractionResult(BaseModel):
+	source_url: HttpUrl | None = None
+	news_urls: list[HttpUrl] = Field(default_factory=list)
+	event_urls: list[HttpUrl] = Field(default_factory=list)
+	ignored_urls: list[str] = Field(default_factory=list)
 
 
-class NewsArticle(BaseModel):
-    title: str
-    lead: str
-    body_text: str
-    published_at: str | None = None
-    source_url: HttpUrl | None = None
-    language: str = "hu"
-    tags: list[str] = Field(default_factory=list)
-    events: list[NewsEvent] = Field(default_factory=list)
+class PageSummary(BaseModel):
+	url: HttpUrl
+	title: str
+	text: str
+	image_url: HttpUrl | None = None
+	summary: str
 
 
-class CrawlRootsRequest(BaseModel):
-    root_urls: list[HttpUrl] = Field(
-        ...,
-        min_length=2,
-        max_length=2,
-        description="Exactly two root URLs: typically university and department homepages.",
-    )
-    max_pages_per_root: int = Field(default=6, ge=1, le=20)
-    language: str = Field(default="hu")
+class SummaryBatchResult(BaseModel):
+	kind: Literal["news", "events"]
+	items: list[PageSummary] = Field(default_factory=list)
+	failed_urls: list[str] = Field(default_factory=list)
 
 
-class CrawledNewsItem(BaseModel):
-    title: str
-    summary: str | None = None
-    published_at: str | None = None
-    url: HttpUrl
-    tags: list[str] = Field(default_factory=list)
-    image_url: HttpUrl | None = None
+class EndToEndResult(BaseModel):
+	extracted: UrlExtractionResult
+	news: SummaryBatchResult
+	events: SummaryBatchResult
 
 
-class CrawledEventItem(BaseModel):
-    title: str
-    description: str | None = None
-    event_time: str | None = None
-    start_at: str | None = None
-    end_at: str | None = None
-    location: str | None = None
-    url: HttpUrl
+@dataclass
+class _LinkCandidate:
+	url: str
+	news_score: int
+	event_score: int
 
 
-class SourceCrawlResult(BaseModel):
-    source_root: str
-    visited_urls: list[str] = Field(default_factory=list)
-    news: list[CrawledNewsItem] = Field(default_factory=list)
-    events: list[CrawledEventItem] = Field(default_factory=list)
-    errors: list[str] = Field(default_factory=list)
+def _normalize_text(value: str) -> str:
+	value = unescape(value or "")
+	value = value.lower().strip()
+	value = re.sub(r"\s+", " ", value)
+	return value
 
 
-EVENT_KEYWORDS = [
-    "rendezveny",
-    "rendezvény",
-    "esemeny",
-    "esemény",
-    "konferencia",
-    "workshop",
-    "szeminarium",
-    "szeminárium",
-    "seminar",
-    "webinar",
-    "meetup",
-    "eloadas",
-    "előadás",
-    "vedes",
-    "védés",
-    "open day",
-    "nyilt nap",
-    "nyílt nap",
-    "jelentkezes",
-    "jelentkezés",
-    "regisztracio",
-    "regisztráció",
-    "registration",
-]
-
-DATE_REGEXES = [
-    re.compile(r"\b(\d{4}-\d{2}-\d{2})\b"),
-    re.compile(r"\b(\d{4}\.\d{1,2}\.\d{1,2}\.)\b"),
-    re.compile(r"\b(\d{1,2}\.\d{1,2}\.\d{4})\b"),
-    re.compile(r"\b(\d{1,2}\.\d{1,2}\.)\b"),
-]
+def _keyword_score(text: str, keywords: set[str]) -> int:
+	if not text:
+		return 0
+	normalized = _normalize_text(text)
+	return sum(1 for kw in keywords if kw in normalized)
 
 
-def _clean_whitespace(text: str) -> str:
-    return re.sub(r"\s+", " ", unescape(text)).strip()
+def _extract_best_title(soup: BeautifulSoup) -> str:
+	og_title = soup.select_one('meta[property="og:title"]')
+	if og_title and og_title.get("content"):
+		return og_title["content"].strip()
+
+	h1 = soup.find("h1")
+	if h1 and h1.get_text(strip=True):
+		return h1.get_text(strip=True)
+
+	if soup.title and soup.title.get_text(strip=True):
+		return soup.title.get_text(strip=True)
+
+	return "Untitled"
 
 
-def _deaccent(text: str) -> str:
-    normalized = unicodedata.normalize("NFKD", text)
-    return "".join(ch for ch in normalized if not unicodedata.combining(ch))
+def _extract_best_image_url(soup: BeautifulSoup, page_url: str) -> str | None:
+	og_image = soup.select_one('meta[property="og:image"]')
+	if og_image and og_image.get("content"):
+		return urljoin(page_url, og_image["content"].strip())
+
+	# Fallback: first large-looking image in article/main/body.
+	scopes = [soup.find("article"), soup.find("main"), soup.body, soup]
+	for scope in scopes:
+		if not scope:
+			continue
+		for img in scope.find_all("img"):
+			src = (img.get("src") or "").strip()
+			if src:
+				return urljoin(page_url, src)
+
+	return None
 
 
-def _normalize_for_match(text: str) -> str:
-    return _deaccent(_clean_whitespace(text)).lower()
+def _extract_best_text(soup: BeautifulSoup) -> str:
+	for trash_selector in ["script", "style", "noscript", "svg"]:
+		for node in soup.select(trash_selector):
+			node.decompose()
+
+	scopes = [soup.find("article"), soup.find("main"), soup.body, soup]
+	chunks: list[str] = []
+	for scope in scopes:
+		if not scope:
+			continue
+
+		for tag in scope.find_all(["p", "li", "blockquote"]):
+			text = tag.get_text(" ", strip=True)
+			if len(text) >= 40:
+				chunks.append(text)
+
+		if chunks:
+			break
+
+	if not chunks:
+		fallback = soup.get_text(" ", strip=True)
+		return re.sub(r"\s+", " ", fallback).strip()
+
+	merged = "\n".join(dict.fromkeys(chunks))
+	return re.sub(r"\s+", " ", merged).strip()
 
 
-def _today_iso(timezone_name: str = "Europe/Budapest") -> str:
-    return datetime.now(ZoneInfo(timezone_name)).date().isoformat()
+def _summarize_text(text: str, max_sentences: int = 3, max_chars: int = 500) -> str:
+	text = re.sub(r"\s+", " ", text or "").strip()
+	if not text:
+		return ""
 
-
-def _is_http_url(value: str) -> bool:
-    parsed = urlparse(value)
-    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
-
-
-def _normalize_hu_date_to_iso(value: str) -> str | None:
-    clean = _clean_whitespace(value)
-
-    iso_match = re.search(r"\b(\d{4})-(\d{2})-(\d{2})\b", clean)
-    if iso_match:
-        year, month, day = iso_match.groups()
-        return f"{year}-{month}-{day}"
-
-    dot_match = re.search(r"\b(\d{4})\.\s*(\d{1,2})\.\s*(\d{1,2})\.\b", clean)
-    if dot_match:
-        year, month, day = dot_match.groups()
-        return f"{int(year):04d}-{int(month):02d}-{int(day):02d}"
-
-    day_first_match = re.search(r"\b(\d{1,2})\.(\d{1,2})\.(\d{4})\b", clean)
-    if day_first_match:
-        day, month, year = day_first_match.groups()
-        return f"{int(year):04d}-{int(month):02d}-{int(day):02d}"
-
-    return None
-
-
-def _normalize_hu_datetime_ranges(value: str) -> tuple[str | None, str | None]:
-    clean = _clean_whitespace(value)
-    date_iso = _normalize_hu_date_to_iso(clean)
-    if not date_iso:
-        return None, None
-
-    times = re.findall(r"\b([01]?\d|2[0-3]):([0-5]\d)\b", clean)
-    if not times:
-        return f"{date_iso}T00:00:00", None
-    if len(times) == 1:
-        hh, mm = times[0]
-        return f"{date_iso}T{int(hh):02d}:{mm}:00", None
-
-    start_hh, start_mm = times[0]
-    end_hh, end_mm = times[1]
-    return (
-        f"{date_iso}T{int(start_hh):02d}:{start_mm}:00",
-        f"{date_iso}T{int(end_hh):02d}:{end_mm}:00",
-    )
-
-
-def _decode_html(raw: bytes, content_type_header: str | None, fallback_charset: str | None) -> str:
-    encodings: list[str] = []
-
-    if fallback_charset:
-        encodings.append(fallback_charset)
-
-    if content_type_header:
-        header_match = re.search(r"charset=([a-zA-Z0-9_\-]+)", content_type_header, flags=re.IGNORECASE)
-        if header_match:
-            encodings.append(header_match.group(1).strip())
-
-    # Hungarian pages are often UTF-8, but cp1250 and iso-8859-2 still appear.
-    encodings.extend(["utf-8", "cp1250", "iso-8859-2", "latin-1"])
-
-    seen: set[str] = set()
-    ordered = [enc for enc in encodings if not (enc.lower() in seen or seen.add(enc.lower()))]
-
-    for encoding in ordered:
-        try:
-            return raw.decode(encoding)
-        except UnicodeDecodeError:
-            continue
-
-    return raw.decode("utf-8", errors="replace")
+	sentences = re.split(r"(?<=[.!?])\s+", text)
+	summary = " ".join(sentences[:max_sentences]).strip()
+	if len(summary) > max_chars:
+		return summary[: max_chars - 3].rstrip() + "..."
+	return summary
 
 
 def _fetch_html(url: str, timeout_seconds: int = 20) -> str:
-    request = Request(
-        url,
-        headers={
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            )
-        },
-    )
-    with urlopen(request, timeout=timeout_seconds) as response:
-        charset = response.headers.get_content_charset()
-        content_type = response.headers.get("Content-Type")
-        raw = response.read()
-        return _decode_html(raw=raw, content_type_header=content_type, fallback_charset=charset)
-
-
-def _safe_fetch_html(url: str, timeout_seconds: int = 20) -> tuple[str | None, str | None]:
-    last_error: Exception | None = None
-    for _ in range(2):
-        try:
-            return _fetch_html(url, timeout_seconds=timeout_seconds), None
-        except (HTTPError, URLError, ValueError, TimeoutError) as exc:
-            last_error = exc
-
-    if last_error is None:
-        return None, f"{url}: unknown fetch error"
-    return None, f"{url}: {type(last_error).__name__}: {last_error}"
-
-
-def _is_same_host(url_a: str, url_b: str) -> bool:
-    return urlparse(url_a).netloc.lower() == urlparse(url_b).netloc.lower()
-
-
-def _normalize_href(base_url: str, href: str) -> str:
-    return urljoin(base_url, href.strip())
-
-
-def _extract_title(soup: BeautifulSoup) -> str:
-    candidates = [
-        soup.find("meta", property="og:title"),
-        soup.find("meta", attrs={"name": "twitter:title"}),
-        soup.find("title"),
-        soup.find("h1"),
-    ]
-    for candidate in candidates:
-        if not candidate:
-            continue
-        if candidate.name == "meta":
-            value = candidate.get("content")
-        else:
-            value = candidate.get_text(" ", strip=True)
-        if value:
-            return _clean_whitespace(value)
-    return "Untitled news"
-
-
-def _extract_lead(soup: BeautifulSoup, fallback_text: str) -> str:
-    meta_description = soup.find("meta", attrs={"name": "description"})
-    if meta_description and meta_description.get("content"):
-        return _clean_whitespace(meta_description["content"])
-
-    first_paragraph = soup.find("p")
-    if first_paragraph:
-        lead = _clean_whitespace(first_paragraph.get_text(" ", strip=True))
-        if lead:
-            return lead
-
-    return _clean_whitespace(fallback_text[:240])
-
-
-def _extract_published_at(soup: BeautifulSoup) -> str | None:
-    time_node = soup.find("time")
-    if time_node:
-        if time_node.get("datetime"):
-            return _clean_whitespace(time_node["datetime"])
-        text = _clean_whitespace(time_node.get_text(" ", strip=True))
-        if text:
-            return text
-
-    for attr_name in ["article:published_time", "publish_date", "date", "dc.date"]:
-        node = soup.find("meta", property=attr_name) or soup.find("meta", attrs={"name": attr_name})
-        if node and node.get("content"):
-            return _clean_whitespace(node["content"])
-
-    return None
-
-
-def _extract_tags(soup: BeautifulSoup) -> list[str]:
-    tags: list[str] = []
-    keywords_node = soup.find("meta", attrs={"name": "keywords"})
-    if keywords_node and keywords_node.get("content"):
-        for item in keywords_node["content"].split(","):
-            cleaned = _clean_whitespace(item).lower()
-            if cleaned and cleaned not in tags:
-                tags.append(cleaned)
-
-    for link in soup.find_all("a"):
-        rel = link.get("rel")
-        if not rel:
-            continue
-        rel_joined = " ".join(rel) if isinstance(rel, list) else str(rel)
-        if "tag" in rel_joined:
-            cleaned = _clean_whitespace(link.get_text(" ", strip=True)).lower()
-            if cleaned and cleaned not in tags:
-                tags.append(cleaned)
-
-    return tags[:12]
-
-
-def _extract_bme_news_cards(soup: BeautifulSoup, base_url: str) -> list[CrawledNewsItem]:
-    cards = soup.select("div.bme_news_card")
-    results: list[CrawledNewsItem] = []
-
-    for card in cards:
-        container_link = card.find_parent("a", href=True)
-        if not container_link:
-            sibling_link = card.find("a", href=True)
-            container_link = sibling_link
-        if not container_link:
-            continue
-
-        href = container_link.get("href", "").strip()
-        if not href:
-            continue
-        full_url = _normalize_href(base_url, href)
-        if not _is_http_url(full_url):
-            continue
-
-        title_node = card.select_one("h4.bme_news_card-title, h3.bme_news_card-title, h4, h3")
-        if not title_node:
-            continue
-        title = _clean_whitespace(title_node.get_text(" ", strip=True))
-        if not title:
-            continue
-
-        summary_node = card.select_one("div.bme_news_card-body p, div.bme_news_card-body")
-        summary = _clean_whitespace(summary_node.get_text(" ", strip=True)) if summary_node else None
-
-        date_node = card.select_one("span.field--name-created")
-        raw_published_at = _clean_whitespace(date_node.get_text(" ", strip=True)) if date_node else None
-        published_at = _normalize_hu_date_to_iso(raw_published_at or "") or raw_published_at
-
-        tag_nodes = card.select("div.bme_news_card-tags li")
-        tags = []
-        for tag_node in tag_nodes:
-            tag_text = _clean_whitespace(tag_node.get_text(" ", strip=True))
-            if tag_text and tag_text not in tags:
-                tags.append(tag_text)
-
-        image_node = card.select_one("img")
-        image_url: str | None = None
-        if image_node:
-            src = (image_node.get("src") or "").strip()
-            if src:
-                candidate_image_url = _normalize_href(base_url, src)
-                if _is_http_url(candidate_image_url):
-                    image_url = candidate_image_url
-
-        results.append(
-            CrawledNewsItem(
-                title=title,
-                summary=summary,
-                published_at=published_at,
-                url=full_url,
-                tags=tags,
-                image_url=image_url,
-            )
-        )
-
-    return results
-
-
-def _extract_department_news_articles(soup: BeautifulSoup, base_url: str) -> list[CrawledNewsItem]:
-    articles = soup.select("article.node-hir, article.node.node-hir")
-    results: list[CrawledNewsItem] = []
-
-    for article in articles:
-        title_link = article.select_one("h2.node__title a, h2.node-title a, h2 a")
-        if not title_link:
-            continue
-
-        href = (title_link.get("href") or "").strip()
-        if not href:
-            href = (article.get("about") or "").strip()
-        if not href:
-            continue
-        full_url = _normalize_href(base_url, href)
-        if not _is_http_url(full_url):
-            continue
-
-        title = _clean_whitespace(title_link.get_text(" ", strip=True))
-        if not title:
-            continue
-
-        summary_node = article.select_one(
-            "div.field-name-body p, div.field--name-body p, div.field-name-body, div.field--name-body"
-        )
-        summary = _clean_whitespace(summary_node.get_text(" ", strip=True)) if summary_node else None
-        if not summary:
-            fallback_summary_node = article.select_one("p")
-            summary = _clean_whitespace(fallback_summary_node.get_text(" ", strip=True)) if fallback_summary_node else None
-
-        date_node = article.select_one(
-            "time, span.field--name-created, span.field-name-created, span[property='dc:date'], meta[property='article:published_time']"
-        )
-        raw_published_at = None
-        if date_node:
-            if date_node.name == "meta":
-                raw_published_at = _clean_whitespace(date_node.get("content", ""))
-            else:
-                raw_published_at = _clean_whitespace(date_node.get_text(" ", strip=True))
-        published_at = _normalize_hu_date_to_iso(raw_published_at or "") or raw_published_at
-
-        tags: list[str] = []
-        for tag_node in article.select("a[rel='tag'], .field-name-field-tags a, .field--name-field-tags a"):
-            tag_text = _clean_whitespace(tag_node.get_text(" ", strip=True))
-            if tag_text and tag_text not in tags:
-                tags.append(tag_text)
-
-        image_node = article.select_one("div.field-name-field-bevezto-kep img, div.field--name-field-bevezto-kep img, img")
-        image_url: str | None = None
-        if image_node:
-            src = (image_node.get("src") or "").strip()
-            if src:
-                candidate_image_url = _normalize_href(base_url, src)
-                if _is_http_url(candidate_image_url):
-                    image_url = candidate_image_url
-
-        results.append(
-            CrawledNewsItem(
-                title=title,
-                summary=summary,
-                published_at=published_at,
-                url=full_url,
-                tags=tags,
-                image_url=image_url,
-            )
-        )
-
-    return results
-
-
-def _extract_bme_event_cards(soup: BeautifulSoup, base_url: str) -> list[CrawledEventItem]:
-    anchors = soup.select("a[href]")
-    results: list[CrawledEventItem] = []
-
-    for anchor in anchors:
-        title_node = anchor.select_one("h4.bme_event_card-title")
-        if not title_node:
-            continue
-
-        href = (anchor.get("href") or "").strip()
-        if not href:
-            continue
-
-        full_url = _normalize_href(base_url, href)
-        if not _is_http_url(full_url):
-            continue
-        title = _clean_whitespace(title_node.get_text(" ", strip=True))
-        if not title:
-            continue
-
-        date_node = anchor.select_one("div.bme_event_card-date")
-        raw_event_time = _clean_whitespace(date_node.get_text(" ", strip=True)) if date_node else None
-        start_at, end_at = _normalize_hu_datetime_ranges(raw_event_time or "")
-        if start_at and end_at:
-            event_time = f"{start_at}/{end_at}"
-        else:
-            event_time = start_at or raw_event_time
-
-        location_node = anchor.select_one("p.bme_event_card-location")
-        location = _clean_whitespace(location_node.get_text(" ", strip=True)) if location_node else None
-
-        body_node = anchor.select_one("div.bme_event_card-body p, div.bme_event_card-body")
-        description = _clean_whitespace(body_node.get_text(" ", strip=True)) if body_node else None
-
-        results.append(
-            CrawledEventItem(
-                title=title,
-                description=description,
-                event_time=event_time,
-                start_at=start_at,
-                end_at=end_at,
-                location=location,
-                url=full_url,
-            )
-        )
-
-    return results
-
-
-def _discover_news_event_links(soup: BeautifulSoup, root_url: str, max_links: int) -> list[str]:
-    keywords = [
-        "hirek",
-        "hírek",
-        "news",
-        "esemeny",
-        "esemény",
-        "esemenyek",
-        "események",
-        "event",
-        "events",
-        "rendezveny",
-        "rendezvény",
-    ]
-    negative_keywords = [
-        "kapcsolat",
-        "contact",
-        "impresszum",
-        "adatvedelem",
-        "adatvédelem",
-        "privacy",
-        "search",
-        "kereses",
-        "keresés",
-        "felveteli",
-        "felvételi",
-        "about",
-        "bemutatkozas",
-        "bemutatkozás",
-    ]
-
-    normalized_keywords = [_normalize_for_match(keyword) for keyword in keywords]
-    normalized_negative = [_normalize_for_match(keyword) for keyword in negative_keywords]
-
-    scored_candidates: list[tuple[int, str]] = []
-    seen_urls: set[str] = set()
-    for anchor in soup.select("a[href]"):
-        href = (anchor.get("href") or "").strip()
-        if not href or href.startswith("#"):
-            continue
-
-        full_url = _normalize_href(root_url, href)
-        if not _is_same_host(root_url, full_url):
-            continue
-
-        raw_text = _clean_whitespace(anchor.get_text(" ", strip=True))
-        normalized_marker = _normalize_for_match(f"{full_url} {raw_text}")
-
-        score = 0
-        if any(keyword in normalized_marker for keyword in normalized_keywords):
-            score += 4
-        if any(path_kw in _normalize_for_match(full_url) for path_kw in ["/hirek", "/esemeny", "/esemenyek", "/node/"]):
-            score += 5
-        class_marker = _normalize_for_match(" ".join(anchor.get("class", [])))
-        if "news" in class_marker or "event" in class_marker or "hir" in class_marker:
-            score += 2
-        if any(neg in normalized_marker for neg in normalized_negative):
-            score -= 8
-
-        if score <= 0:
-            continue
-
-        dedupe_key = full_url.lower()
-        if dedupe_key in seen_urls:
-            continue
-        seen_urls.add(dedupe_key)
-        scored_candidates.append((score, full_url))
-
-    scored_candidates.sort(key=lambda item: item[0], reverse=True)
-    return [url for _, url in scored_candidates[:max_links]]
-
-
-def _dedupe_news_items(items: list[CrawledNewsItem]) -> list[CrawledNewsItem]:
-    deduped: dict[str, CrawledNewsItem] = {}
-    for item in items:
-        key = str(item.url).lower()
-        if key not in deduped:
-            deduped[key] = item
-    return list(deduped.values())
-
-
-def _dedupe_event_items(items: list[CrawledEventItem]) -> list[CrawledEventItem]:
-    deduped: dict[str, CrawledEventItem] = {}
-    for item in items:
-        key = str(item.url).lower()
-        if key not in deduped:
-            deduped[key] = item
-    return list(deduped.values())
-
-
-def _filter_news_by_date(items: list[CrawledNewsItem], target_iso_date: str) -> list[CrawledNewsItem]:
-    filtered: list[CrawledNewsItem] = []
-    for item in items:
-        if not item.published_at:
-            continue
-        normalized = _normalize_hu_date_to_iso(item.published_at) or item.published_at
-        if normalized == target_iso_date:
-            filtered.append(item)
-    return filtered
-
-
-def _extract_text(soup: BeautifulSoup) -> str:
-    for node in soup(["script", "style", "noscript"]):
-        node.decompose()
-
-    paragraph_texts: list[str] = []
-    for paragraph in soup.find_all("p"):
-        text = _clean_whitespace(paragraph.get_text(" ", strip=True))
-        if len(text) > 20:
-            paragraph_texts.append(text)
-
-    if paragraph_texts:
-        return "\n\n".join(paragraph_texts)
-
-    return _clean_whitespace(soup.get_text(" ", strip=True))
-
-
-def _extract_registration_urls(soup: BeautifulSoup) -> list[str]:
-    urls: list[str] = []
-    trigger_words = ["register", "registration", "jelentke", "eventbrite", "forms.gle"]
-    for anchor in soup.find_all("a"):
-        href = (anchor.get("href") or "").strip()
-        if not href:
-            continue
-        text = _clean_whitespace(anchor.get_text(" ", strip=True)).lower()
-        marker = f"{href.lower()} {text}"
-        if any(trigger in marker for trigger in trigger_words):
-            urls.append(href)
-
-    unique_urls: list[str] = []
-    for url in urls:
-        if url not in unique_urls:
-            unique_urls.append(url)
-    return unique_urls
-
-
-def _extract_dates(text: str) -> list[str]:
-    found: list[str] = []
-
-    for match in re.finditer(r"\b(\d{4})-(\d{2})-(\d{2})\b", text):
-        iso = f"{match.group(1)}-{match.group(2)}-{match.group(3)}"
-        if iso not in found:
-            found.append(iso)
-
-    for match in re.finditer(r"\b(\d{4})\.\s*(\d{1,2})\.\s*(\d{1,2})\.\b", text):
-        iso = f"{int(match.group(1)):04d}-{int(match.group(2)):02d}-{int(match.group(3)):02d}"
-        if iso not in found:
-            found.append(iso)
-
-    for match in re.finditer(r"\b(\d{1,2})\.(\d{1,2})\.(\d{4})\b", text):
-        iso = f"{int(match.group(3)):04d}-{int(match.group(2)):02d}-{int(match.group(1)):02d}"
-        if iso not in found:
-            found.append(iso)
-
-    for pattern in DATE_REGEXES:
-        for match in pattern.finditer(text):
-            value = match.group(1)
-            if value not in found:
-                found.append(value)
-    return found[:3]
-
-
-def _normalize_event_name(sentence: str) -> str:
-    clean = _clean_whitespace(sentence)
-    if len(clean) <= 90:
-        return clean
-    return clean[:87].rstrip() + "..."
-
-
-def _detect_events(text: str, registration_urls: list[str] | None = None) -> list[NewsEvent]:
-    registration_urls = registration_urls or []
-    sentences = re.split(r"(?<=[.!?])\s+", text)
-    events: list[NewsEvent] = []
-    normalized_keywords = [_normalize_for_match(keyword) for keyword in EVENT_KEYWORDS]
-
-    for sentence in sentences:
-        normalized = _normalize_for_match(sentence)
-        keyword_hits = [kw for kw in normalized_keywords if kw in normalized]
-        if not keyword_hits:
-            continue
-
-        dates = _extract_dates(sentence)
-        registration_in_text = any(
-            marker in normalized for marker in ["jelentkez", "regisztr", "registration", "register"]
-        )
-
-        possible_location_match = re.search(
-            (
-                r"\b(Budapest|Debrecen|Szeged|Miskolc|Gyor|Gyorben|online|campus|epulet|"
-                r"building|terem|hall|audit[oó]rium|d[íi]szterem|k\. ?[ée]p[üu]let)\b"
-            ),
-            sentence,
-            flags=re.IGNORECASE,
-        )
-        location = possible_location_match.group(1) if possible_location_match else None
-
-        registration_url = registration_urls[0] if registration_urls else None
-        has_date = bool(dates)
-        has_location = bool(location)
-        has_registration = bool(registration_url or registration_in_text)
-
-        if not (has_date or has_location or has_registration):
-            continue
-
-        confidence = 0.25
-        confidence += min(0.3, 0.08 * len(keyword_hits))
-        if has_date:
-            confidence += 0.2
-        if has_location:
-            confidence += 0.15
-        if has_registration:
-            confidence += 0.15
-        confidence = min(confidence, 0.95)
-
-        if confidence < 0.5:
-            continue
-
-        event = NewsEvent(
-            name=_normalize_event_name(sentence),
-            start_date=dates[0] if dates else None,
-            location=location,
-            registration_url=registration_url,
-            confidence=confidence,
-            evidence=f"keywords: {', '.join(keyword_hits)}",
-        )
-        events.append(event)
-
-    # De-duplicate by event name while keeping the most confident one.
-    deduped: dict[str, NewsEvent] = {}
-    for event in events:
-        key = event.name.lower()
-        if key not in deduped or event.confidence > deduped[key].confidence:
-            deduped[key] = event
-
-    return list(deduped.values())[:5]
-
-
-@mcp.tool
-def parse_news_html(request: NewsIngestRequest) -> dict:
-    """Parse raw HTML news into a structured article model with detected events."""
-    soup = BeautifulSoup(request.html, "html.parser")
-
-    body_text = _extract_text(soup)
-    article = NewsArticle(
-        title=_extract_title(soup),
-        lead=_extract_lead(soup, body_text),
-        body_text=body_text,
-        published_at=_extract_published_at(soup),
-        source_url=request.source_url,
-        language=request.language,
-        tags=_extract_tags(soup),
-        events=_detect_events(body_text, _extract_registration_urls(soup)),
-    )
-    return article.model_dump(mode="json")
-
-
-@mcp.tool
-def detect_events(article_text: str, registration_urls: list[str] | None = None) -> list[dict]:
-    """Detect event candidates from article text and optional registration URLs."""
-    events = _detect_events(article_text, registration_urls)
-    return [event.model_dump(mode="json") for event in events]
-
-
-@mcp.tool
-def get_current_date(timezone_name: str = "Europe/Budapest") -> dict:
-    """Return the current date in ISO format; default timezone is Europe/Budapest."""
-    now = datetime.now(ZoneInfo(timezone_name))
-    return {
-        "timezone": timezone_name,
-        "iso_date": now.date().isoformat(),
-        "iso_datetime": now.isoformat(),
-    }
-
-
-@mcp.tool
-def crawl_news_and_events_from_roots(request: CrawlRootsRequest) -> dict:
-    """Crawl exactly two root URLs and collect news/event cards through discovered subpages."""
-    source_results: list[SourceCrawlResult] = []
-    current_date_iso = _today_iso("Europe/Budapest")
-
-    for root_url_obj in request.root_urls:
-        root_url = str(root_url_obj)
-        visited_urls: list[str] = []
-        errors: list[str] = []
-
-        root_html, root_error = _safe_fetch_html(root_url)
-        if root_error:
-            source_results.append(
-                SourceCrawlResult(
-                    source_root=root_url,
-                    visited_urls=visited_urls,
-                    news=[],
-                    events=[],
-                    errors=[root_error],
-                )
-            )
-            continue
-
-        visited_urls.append(root_url)
-        if root_html is None:
-            source_results.append(
-                SourceCrawlResult(
-                    source_root=root_url,
-                    visited_urls=visited_urls,
-                    news=[],
-                    events=[],
-                    errors=errors + [f"{root_url}: empty response body"],
-                )
-            )
-            continue
-        root_soup = BeautifulSoup(root_html, "html.parser")
-
-        all_news = _extract_bme_news_cards(root_soup, root_url)
-        all_news.extend(_extract_department_news_articles(root_soup, root_url))
-        all_events = _extract_bme_event_cards(root_soup, root_url)
-
-        candidate_links = _discover_news_event_links(
-            root_soup,
-            root_url=root_url,
-            max_links=request.max_pages_per_root,
-        )
-
-        for link in candidate_links:
-            if link in visited_urls:
-                continue
-
-            page_html, page_error = _safe_fetch_html(link)
-            visited_urls.append(link)
-
-            if page_error:
-                errors.append(page_error)
-                continue
-
-            if page_html is None:
-                errors.append(f"{link}: empty response body")
-                continue
-            page_soup = BeautifulSoup(page_html, "html.parser")
-            all_news.extend(_extract_bme_news_cards(page_soup, link))
-            all_news.extend(_extract_department_news_articles(page_soup, link))
-            all_events.extend(_extract_bme_event_cards(page_soup, link))
-
-        source_results.append(
-            SourceCrawlResult(
-                source_root=root_url,
-                visited_urls=visited_urls,
-                news=_filter_news_by_date(_dedupe_news_items(all_news), current_date_iso),
-                events=_dedupe_event_items(all_events),
-                errors=errors,
-            )
-        )
-
-    total_news = sum(len(result.news) for result in source_results)
-    total_events = sum(len(result.events) for result in source_results)
-
-    return {
-        "language": request.language,
-        "current_date": current_date_iso,
-        "sources": [result.model_dump(mode="json") for result in source_results],
-        "summary": {
-            "source_count": len(source_results),
-            "total_news": total_news,
-            "total_events": total_events,
-        },
-    }
-
-
-def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run FastMCP news content server")
-    parser.add_argument("--host", default="0.0.0.0")
-    parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--path", default="/mcp")
-    return parser
+	request = Request(
+		url,
+		headers={
+			"User-Agent": "Mozilla/5.0 (compatible; FastMCPNewsAgent/1.0)",
+			"Accept": "text/html,application/xhtml+xml",
+		},
+	)
+
+	with urlopen(request, timeout=timeout_seconds) as response:
+		raw = response.read()
+		encoding = response.headers.get_content_charset() or "utf-8"
+
+	try:
+		return raw.decode(encoding, errors="replace")
+	except LookupError:
+		return raw.decode("utf-8", errors="replace")
+
+
+def _collect_link_candidates(html: str, base_url: str | None = None) -> tuple[list[_LinkCandidate], list[str]]:
+	soup = BeautifulSoup(html, "html.parser")
+	candidates: list[_LinkCandidate] = []
+	ignored: list[str] = []
+	seen: set[str] = set()
+
+	for link in soup.find_all("a"):
+		href = (link.get("href") or "").strip()
+		if not href or href.startswith("#"):
+			continue
+
+		resolved_url = urljoin(base_url, href) if base_url else href
+		if not resolved_url.startswith(("http://", "https://")):
+			ignored.append(href)
+			continue
+
+		if resolved_url in seen:
+			continue
+		seen.add(resolved_url)
+
+		anchor_text = link.get_text(" ", strip=True)
+		parent_text = ""
+		if link.parent:
+			parent_text = link.parent.get_text(" ", strip=True)
+
+		class_blob = " ".join(link.get("class", []))
+		id_blob = str(link.get("id") or "")
+		score_source = " ".join([resolved_url, anchor_text, parent_text, class_blob, id_blob])
+
+		news_score = _keyword_score(score_source, NEWS_KEYWORDS)
+		event_score = _keyword_score(score_source, EVENT_KEYWORDS)
+		if news_score == 0 and event_score == 0:
+			continue
+
+		candidates.append(
+			_LinkCandidate(
+				url=resolved_url,
+				news_score=news_score,
+				event_score=event_score,
+			)
+		)
+
+	return candidates, ignored
+
+
+def _split_news_and_event_urls(
+	candidates: list[_LinkCandidate], max_per_type: int
+) -> tuple[list[str], list[str]]:
+	news: list[str] = []
+	events: list[str] = []
+
+	for candidate in sorted(candidates, key=lambda item: (item.news_score + item.event_score), reverse=True):
+		if candidate.news_score >= candidate.event_score and len(news) < max_per_type:
+			news.append(candidate.url)
+		if candidate.event_score > candidate.news_score and len(events) < max_per_type:
+			events.append(candidate.url)
+
+		# If both are strong matches, include in both lists when there is room.
+		if candidate.news_score > 0 and candidate.event_score > 0:
+			if candidate.url not in news and len(news) < max_per_type:
+				news.append(candidate.url)
+			if candidate.url not in events and len(events) < max_per_type:
+				events.append(candidate.url)
+
+	return news, events
+
+
+def _summarize_pages(urls: list[str], kind: Literal["news", "events"], timeout_seconds: int) -> SummaryBatchResult:
+	items: list[PageSummary] = []
+	failed: list[str] = []
+
+	for url in urls:
+		try:
+			html = _fetch_html(url=url, timeout_seconds=timeout_seconds)
+			soup = BeautifulSoup(html, "html.parser")
+
+			title = _extract_best_title(soup)
+			text = _extract_best_text(soup)
+			image_url = _extract_best_image_url(soup, page_url=url)
+
+			items.append(
+				PageSummary(
+					url=url,
+					title=title,
+					text=text,
+					image_url=image_url,
+					summary=_summarize_text(text),
+				)
+			)
+		except Exception:
+			failed.append(url)
+
+	return SummaryBatchResult(kind=kind, items=items, failed_urls=failed)
+
+
+@mcp.tool()
+def extract_news_and_event_urls(
+	html: str,
+	base_url: str | None = None,
+	max_per_type: int = 30,
+) -> dict:
+	"""
+	Extract likely news and event URLs from a provided HTML page.
+
+	Args:
+		html: Raw HTML string from user input.
+		base_url: Optional base URL used to resolve relative links.
+		max_per_type: Maximum number of URLs to return for each category.
+	"""
+	candidates, ignored = _collect_link_candidates(html=html, base_url=base_url)
+	news_urls, event_urls = _split_news_and_event_urls(candidates=candidates, max_per_type=max_per_type)
+
+	result = UrlExtractionResult(
+		source_url=base_url,
+		news_urls=news_urls,
+		event_urls=event_urls,
+		ignored_urls=ignored,
+	)
+	return result.model_dump(mode="json")
+
+
+@mcp.tool()
+def summarize_news_from_urls(urls: list[str], timeout_seconds: int = 20) -> dict:
+	"""
+	Download and summarize news pages.
+
+	For each URL the tool extracts title, main text, first image URL, and a short summary.
+	"""
+	result = _summarize_pages(urls=urls, kind="news", timeout_seconds=timeout_seconds)
+	return result.model_dump(mode="json")
+
+
+@mcp.tool()
+def summarize_events_from_urls(urls: list[str], timeout_seconds: int = 20) -> dict:
+	"""
+	Download and summarize event pages.
+
+	For each URL the tool extracts title, main text, first image URL, and a short summary.
+	"""
+	result = _summarize_pages(urls=urls, kind="events", timeout_seconds=timeout_seconds)
+	return result.model_dump(mode="json")
+
+
+@mcp.tool()
+def process_news_and_events_from_html(
+	html: str,
+	base_url: str | None = None,
+	max_per_type: int = 15,
+	timeout_seconds: int = 20,
+) -> dict:
+	"""
+	End-to-end tool: extract links from HTML, then fetch and summarize both news and event pages.
+	"""
+	extracted = extract_news_and_event_urls(html=html, base_url=base_url, max_per_type=max_per_type)
+
+	news_urls = extracted.get("news_urls", [])
+	event_urls = extracted.get("event_urls", [])
+
+	news_result = _summarize_pages(urls=news_urls, kind="news", timeout_seconds=timeout_seconds)
+	event_result = _summarize_pages(urls=event_urls, kind="events", timeout_seconds=timeout_seconds)
+
+	final = EndToEndResult(
+		extracted=UrlExtractionResult.model_validate(extracted),
+		news=news_result,
+		events=event_result,
+	)
+	return final.model_dump(mode="json")
+
+
+@mcp.tool()
+def health() -> dict:
+	"""Simple health-check tool."""
+	return {"status": "ok"}
+
+
+def _parse_args() -> argparse.Namespace:
+	parser = argparse.ArgumentParser(description="FastMCP server for news and events processing")
+	parser.add_argument("--host", default="0.0.0.0", help="Host to bind")
+	parser.add_argument("--port", type=int, default=8000, help="Port to bind")
+	parser.add_argument("--path", default="/mcp", help="MCP HTTP path")
+	return parser.parse_args()
 
 
 def main() -> None:
-    args = _build_parser().parse_args()
+	args = _parse_args()
 
-    # Compatibility fallback across FastMCP versions.
-    try:
-        mcp.run(transport="streamable-http", host=args.host, port=args.port, path=args.path)
-        return
-    except TypeError:
-        pass
-
-    try:
-        mcp.run(host=args.host, port=args.port, path=args.path)
-        return
-    except TypeError:
-        pass
-
-    mcp.run()
+	# Newer fastmcp versions commonly use streamable-http transport.
+	try:
+		mcp.run(transport="streamable-http", host=args.host, port=args.port, path=args.path)
+	except TypeError:
+		# Fallback for fastmcp variants with a different run signature.
+		mcp.run(host=args.host, port=args.port, path=args.path)
 
 
 if __name__ == "__main__":
-    main()
+	main()
