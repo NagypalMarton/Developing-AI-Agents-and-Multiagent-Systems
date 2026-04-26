@@ -1,378 +1,277 @@
 from __future__ import annotations
 
-import argparse
 import re
-from dataclasses import dataclass
-from html import unescape
 from typing import Literal
-from urllib.parse import urljoin
-from urllib.request import Request, urlopen
+from urllib.parse import urljoin, urlparse
 
+import requests
 from bs4 import BeautifulSoup
 from fastmcp import FastMCP
-from pydantic import BaseModel, Field, HttpUrl
+from pydantic import BaseModel, Field, HttpUrl, model_validator
 
 
-mcp = FastMCP("news-events-agent")
+DEFAULT_NEWS_KEYWORDS = ["hir", "news", "article", "cikk"]
+DEFAULT_EVENT_KEYWORDS = ["esemeny", "event", "program", "calendar", "koncert"]
+SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\\s+")
 
 
-NEWS_KEYWORDS = {
-	"news",
-	"hir",
-	"article",
-	"aktualis",
-	"blog",
-	"post",
-	"announcement",
-	"announcements",
-}
+class UrlDiscoveryInput(BaseModel):
+    page_url: HttpUrl | None = Field(
+        default=None,
+        description="A forras oldal URL-je, ahonnan a linkeket gyujtjuk.",
+    )
+    html_content: str | None = Field(
+        default=None,
+        description="Kozvetlenul megadott HTML tartalom. Akkor hasznald, ha nincs page_url.",
+    )
+    base_url: HttpUrl | None = Field(
+        default=None,
+        description="Relativ URL-ek feloldasahoz hasznalt bazis URL.",
+    )
+    news_keywords: list[str] = Field(
+        default_factory=lambda: DEFAULT_NEWS_KEYWORDS.copy(),
+        description="Kulcsszavak a hir linkek felismeresehez.",
+    )
+    event_keywords: list[str] = Field(
+        default_factory=lambda: DEFAULT_EVENT_KEYWORDS.copy(),
+        description="Kulcsszavak az esemeny linkek felismeresehez.",
+    )
 
-EVENT_KEYWORDS = {
-	"event",
-	"events",
-	"esemeny",
-	"esemenyek",
-	"calendar",
-	"program",
-	"conference",
-	"workshop",
-	"meetup",
-	"webinar",
-}
-
-
-class UrlExtractionResult(BaseModel):
-	source_url: HttpUrl | None = None
-	news_urls: list[HttpUrl] = Field(default_factory=list)
-	event_urls: list[HttpUrl] = Field(default_factory=list)
-	ignored_urls: list[str] = Field(default_factory=list)
+    @model_validator(mode="after")
+    def validate_source(self) -> "UrlDiscoveryInput":
+        if not self.page_url and not self.html_content:
+            raise ValueError("Adj meg page_url vagy html_content erteket.")
+        return self
 
 
-class PageSummary(BaseModel):
-	url: HttpUrl
-	title: str
-	text: str
-	image_url: HttpUrl | None = None
-	summary: str
+class UrlDiscoveryResult(BaseModel):
+    source_url: HttpUrl | None
+    total_links_scanned: int
+    news_urls: list[HttpUrl]
+    event_urls: list[HttpUrl]
 
 
-class SummaryBatchResult(BaseModel):
-	kind: Literal["news", "events"]
-	items: list[PageSummary] = Field(default_factory=list)
-	failed_urls: list[str] = Field(default_factory=list)
+class UrlSummarizeInput(BaseModel):
+    urls: list[HttpUrl] = Field(description="Feldolgozando oldalak URL-jei.")
+    max_items: int = Field(default=10, ge=1, le=100)
+    summary_sentence_count: int = Field(default=3, ge=1, le=10)
 
 
-class EndToEndResult(BaseModel):
-	extracted: UrlExtractionResult
-	news: SummaryBatchResult
-	events: SummaryBatchResult
+class ContentItem(BaseModel):
+    kind: Literal["news", "event"]
+    url: HttpUrl
+    title: str | None = None
+    text: str | None = None
+    image_url: HttpUrl | None = None
+    summary: str | None = None
 
 
-@dataclass
-class _LinkCandidate:
-	url: str
-	news_score: int
-	event_score: int
+class ContentBatchResult(BaseModel):
+    processed_count: int
+    items: list[ContentItem]
+    errors: list[str]
 
 
-def _normalize_text(value: str) -> str:
-	value = unescape(value or "")
-	value = value.lower().strip()
-	value = re.sub(r"\s+", " ", value)
-	return value
+def _fetch_html(url: str, timeout: int = 15) -> str:
+    response = requests.get(
+        url,
+        timeout=timeout,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0 Safari/537.36"
+            )
+        },
+    )
+    response.raise_for_status()
+    return response.text
 
 
-def _keyword_score(text: str, keywords: set[str]) -> int:
-	if not text:
-		return 0
-	normalized = _normalize_text(text)
-	return sum(1 for kw in keywords if kw in normalized)
+def _normalize_url(href: str | None, base_url: str | None) -> str | None:
+    if not href:
+        return None
+
+    href = href.strip()
+    if href.startswith("javascript:") or href.startswith("#"):
+        return None
+
+    if base_url:
+        return urljoin(base_url, href)
+
+    parsed = urlparse(href)
+    if parsed.scheme in {"http", "https"}:
+        return href
+    return None
 
 
-def _extract_best_title(soup: BeautifulSoup) -> str:
-	og_title = soup.select_one('meta[property="og:title"]')
-	if og_title and og_title.get("content"):
-		return og_title["content"].strip()
+def _extract_main_text(soup: BeautifulSoup) -> str | None:
+    candidates = [
+        soup.find("article"),
+        soup.find("main"),
+        soup.find("div", class_=re.compile("article|content|post|entry", re.I)),
+    ]
 
-	h1 = soup.find("h1")
-	if h1 and h1.get_text(strip=True):
-		return h1.get_text(strip=True)
+    for candidate in candidates:
+        if candidate:
+            paragraphs = [
+                p.get_text(" ", strip=True)
+                for p in candidate.find_all("p")
+                if p.get_text(strip=True)
+            ]
+            if paragraphs:
+                text = "\\n".join(paragraphs)
+                if len(text) >= 120:
+                    return text
 
-	if soup.title and soup.title.get_text(strip=True):
-		return soup.title.get_text(strip=True)
-
-	return "Untitled"
-
-
-def _extract_best_image_url(soup: BeautifulSoup, page_url: str) -> str | None:
-	og_image = soup.select_one('meta[property="og:image"]')
-	if og_image and og_image.get("content"):
-		return urljoin(page_url, og_image["content"].strip())
-
-	# Fallback: first large-looking image in article/main/body.
-	scopes = [soup.find("article"), soup.find("main"), soup.body, soup]
-	for scope in scopes:
-		if not scope:
-			continue
-		for img in scope.find_all("img"):
-			src = (img.get("src") or "").strip()
-			if src:
-				return urljoin(page_url, src)
-
-	return None
+    paragraphs = [p.get_text(" ", strip=True) for p in soup.find_all("p") if p.get_text(strip=True)]
+    if paragraphs:
+        return "\\n".join(paragraphs)
+    return None
 
 
-def _extract_best_text(soup: BeautifulSoup) -> str:
-	for trash_selector in ["script", "style", "noscript", "svg"]:
-		for node in soup.select(trash_selector):
-			node.decompose()
+def _extract_title(soup: BeautifulSoup) -> str | None:
+    og_title = soup.find("meta", attrs={"property": "og:title"})
+    if og_title and og_title.get("content"):
+        return og_title["content"].strip()
 
-	scopes = [soup.find("article"), soup.find("main"), soup.body, soup]
-	chunks: list[str] = []
-	for scope in scopes:
-		if not scope:
-			continue
+    h1 = soup.find("h1")
+    if h1 and h1.get_text(strip=True):
+        return h1.get_text(" ", strip=True)
 
-		for tag in scope.find_all(["p", "li", "blockquote"]):
-			text = tag.get_text(" ", strip=True)
-			if len(text) >= 40:
-				chunks.append(text)
+    if soup.title and soup.title.get_text(strip=True):
+        return soup.title.get_text(" ", strip=True)
 
-		if chunks:
-			break
-
-	if not chunks:
-		fallback = soup.get_text(" ", strip=True)
-		return re.sub(r"\s+", " ", fallback).strip()
-
-	merged = "\n".join(dict.fromkeys(chunks))
-	return re.sub(r"\s+", " ", merged).strip()
+    return None
 
 
-def _summarize_text(text: str, max_sentences: int = 3, max_chars: int = 500) -> str:
-	text = re.sub(r"\s+", " ", text or "").strip()
-	if not text:
-		return ""
+def _extract_image_url(soup: BeautifulSoup, page_url: str) -> str | None:
+    og_image = soup.find("meta", attrs={"property": "og:image"})
+    if og_image and og_image.get("content"):
+        return urljoin(page_url, og_image["content"].strip())
 
-	sentences = re.split(r"(?<=[.!?])\s+", text)
-	summary = " ".join(sentences[:max_sentences]).strip()
-	if len(summary) > max_chars:
-		return summary[: max_chars - 3].rstrip() + "..."
-	return summary
+    first_image = soup.find("img")
+    if first_image and first_image.get("src"):
+        return urljoin(page_url, first_image["src"].strip())
 
-
-def _fetch_html(url: str, timeout_seconds: int = 20) -> str:
-	request = Request(
-		url,
-		headers={
-			"User-Agent": "Mozilla/5.0 (compatible; FastMCPNewsAgent/1.0)",
-			"Accept": "text/html,application/xhtml+xml",
-		},
-	)
-
-	with urlopen(request, timeout=timeout_seconds) as response:
-		raw = response.read()
-		encoding = response.headers.get_content_charset() or "utf-8"
-
-	try:
-		return raw.decode(encoding, errors="replace")
-	except LookupError:
-		return raw.decode("utf-8", errors="replace")
+    return None
 
 
-def _collect_link_candidates(html: str, base_url: str | None = None) -> tuple[list[_LinkCandidate], list[str]]:
-	soup = BeautifulSoup(html, "html.parser")
-	candidates: list[_LinkCandidate] = []
-	ignored: list[str] = []
-	seen: set[str] = set()
+def _make_summary(text: str | None, max_sentences: int) -> str | None:
+    if not text:
+        return None
 
-	for link in soup.find_all("a"):
-		href = (link.get("href") or "").strip()
-		if not href or href.startswith("#"):
-			continue
+    normalized = re.sub(r"\\s+", " ", text).strip()
+    if not normalized:
+        return None
 
-		resolved_url = urljoin(base_url, href) if base_url else href
-		if not resolved_url.startswith(("http://", "https://")):
-			ignored.append(href)
-			continue
+    sentences = [s.strip() for s in SENTENCE_SPLIT_RE.split(normalized) if s.strip()]
+    if not sentences:
+        return normalized[:300]
 
-		if resolved_url in seen:
-			continue
-		seen.add(resolved_url)
-
-		anchor_text = link.get_text(" ", strip=True)
-		parent_text = ""
-		if link.parent:
-			parent_text = link.parent.get_text(" ", strip=True)
-
-		class_blob = " ".join(link.get("class", []))
-		id_blob = str(link.get("id") or "")
-		score_source = " ".join([resolved_url, anchor_text, parent_text, class_blob, id_blob])
-
-		news_score = _keyword_score(score_source, NEWS_KEYWORDS)
-		event_score = _keyword_score(score_source, EVENT_KEYWORDS)
-		if news_score == 0 and event_score == 0:
-			continue
-
-		candidates.append(
-			_LinkCandidate(
-				url=resolved_url,
-				news_score=news_score,
-				event_score=event_score,
-			)
-		)
-
-	return candidates, ignored
+    return " ".join(sentences[:max_sentences])
 
 
-def _split_news_and_event_urls(
-	candidates: list[_LinkCandidate], max_per_type: int
-) -> tuple[list[str], list[str]]:
-	news: list[str] = []
-	events: list[str] = []
+def _extract_item_from_url(url: str, kind: Literal["news", "event"], sentence_count: int) -> ContentItem:
+    html = _fetch_html(url)
+    soup = BeautifulSoup(html, "lxml")
 
-	for candidate in sorted(candidates, key=lambda item: (item.news_score + item.event_score), reverse=True):
-		if candidate.news_score >= candidate.event_score and len(news) < max_per_type:
-			news.append(candidate.url)
-		if candidate.event_score > candidate.news_score and len(events) < max_per_type:
-			events.append(candidate.url)
+    title = _extract_title(soup)
+    text = _extract_main_text(soup)
+    image_url = _extract_image_url(soup, url)
+    summary = _make_summary(text, sentence_count)
 
-		# If both are strong matches, include in both lists when there is room.
-		if candidate.news_score > 0 and candidate.event_score > 0:
-			if candidate.url not in news and len(news) < max_per_type:
-				news.append(candidate.url)
-			if candidate.url not in events and len(events) < max_per_type:
-				events.append(candidate.url)
-
-	return news, events
+    return ContentItem(
+        kind=kind,
+        url=url,
+        title=title,
+        text=text,
+        image_url=image_url,
+        summary=summary,
+    )
 
 
-def _summarize_pages(urls: list[str], kind: Literal["news", "events"], timeout_seconds: int) -> SummaryBatchResult:
-	items: list[PageSummary] = []
-	failed: list[str] = []
+def _discover_urls(payload: UrlDiscoveryInput) -> UrlDiscoveryResult:
+    html = payload.html_content
+    if payload.page_url:
+        html = _fetch_html(str(payload.page_url))
 
-	for url in urls:
-		try:
-			html = _fetch_html(url=url, timeout_seconds=timeout_seconds)
-			soup = BeautifulSoup(html, "html.parser")
+    if not html:
+        raise ValueError("Nem talalhato HTML tartalom a feldolgozashoz.")
 
-			title = _extract_best_title(soup)
-			text = _extract_best_text(soup)
-			image_url = _extract_best_image_url(soup, page_url=url)
+    base = str(payload.base_url or payload.page_url) if (payload.base_url or payload.page_url) else None
+    soup = BeautifulSoup(html, "lxml")
 
-			items.append(
-				PageSummary(
-					url=url,
-					title=title,
-					text=text,
-					image_url=image_url,
-					summary=_summarize_text(text),
-				)
-			)
-		except Exception:
-			failed.append(url)
+    scanned_links = 0
+    news_urls: list[str] = []
+    event_urls: list[str] = []
 
-	return SummaryBatchResult(kind=kind, items=items, failed_urls=failed)
+    for a_tag in soup.find_all("a"):
+        scanned_links += 1
+        href = a_tag.get("href")
+        absolute_url = _normalize_url(href, base)
+        if not absolute_url:
+            continue
+
+        haystack = f"{absolute_url} {a_tag.get_text(' ', strip=True)}".lower()
+
+        if any(keyword.lower() in haystack for keyword in payload.news_keywords):
+            news_urls.append(absolute_url)
+
+        if any(keyword.lower() in haystack for keyword in payload.event_keywords):
+            event_urls.append(absolute_url)
+
+    unique_news = sorted(set(news_urls))
+    unique_events = sorted(set(event_urls))
+
+    return UrlDiscoveryResult(
+        source_url=payload.page_url,
+        total_links_scanned=scanned_links,
+        news_urls=unique_news,
+        event_urls=unique_events,
+    )
+
+
+def _summarize_urls(payload: UrlSummarizeInput, kind: Literal["news", "event"]) -> ContentBatchResult:
+    selected = payload.urls[: payload.max_items]
+
+    items: list[ContentItem] = []
+    errors: list[str] = []
+
+    for url in selected:
+        try:
+            item = _extract_item_from_url(str(url), kind=kind, sentence_count=payload.summary_sentence_count)
+            items.append(item)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{url} -> {exc}")
+
+    return ContentBatchResult(
+        processed_count=len(items),
+        items=items,
+        errors=errors,
+    )
+
+
+mcp = FastMCP(name="NewsEventsAgent")
 
 
 @mcp.tool()
-def extract_news_and_event_urls(
-	html: str,
-	base_url: str | None = None,
-	max_per_type: int = 30,
-) -> dict:
-	"""
-	Extract likely news and event URLs from a provided HTML page.
-
-	Args:
-		html: Raw HTML string from user input.
-		base_url: Optional base URL used to resolve relative links.
-		max_per_type: Maximum number of URLs to return for each category.
-	"""
-	candidates, ignored = _collect_link_candidates(html=html, base_url=base_url)
-	news_urls, event_urls = _split_news_and_event_urls(candidates=candidates, max_per_type=max_per_type)
-
-	result = UrlExtractionResult(
-		source_url=base_url,
-		news_urls=news_urls,
-		event_urls=event_urls,
-		ignored_urls=ignored,
-	)
-	return result.model_dump(mode="json")
+def discover_news_event_urls(input_data: UrlDiscoveryInput) -> UrlDiscoveryResult:
+    """HTML oldalon hir es esemeny URL-ek kigyujtese."""
+    return _discover_urls(input_data)
 
 
 @mcp.tool()
-def summarize_news_from_urls(urls: list[str], timeout_seconds: int = 20) -> dict:
-	"""
-	Download and summarize news pages.
-
-	For each URL the tool extracts title, main text, first image URL, and a short summary.
-	"""
-	result = _summarize_pages(urls=urls, kind="news", timeout_seconds=timeout_seconds)
-	return result.model_dump(mode="json")
+def summarize_news_urls(input_data: UrlSummarizeInput) -> ContentBatchResult:
+    """Hir URL-ek letoltese, tartalomkinyerese es rovid osszefoglalasa."""
+    return _summarize_urls(input_data, kind="news")
 
 
 @mcp.tool()
-def summarize_events_from_urls(urls: list[str], timeout_seconds: int = 20) -> dict:
-	"""
-	Download and summarize event pages.
-
-	For each URL the tool extracts title, main text, first image URL, and a short summary.
-	"""
-	result = _summarize_pages(urls=urls, kind="events", timeout_seconds=timeout_seconds)
-	return result.model_dump(mode="json")
-
-
-@mcp.tool()
-def process_news_and_events_from_html(
-	html: str,
-	base_url: str | None = None,
-	max_per_type: int = 15,
-	timeout_seconds: int = 20,
-) -> dict:
-	"""
-	End-to-end tool: extract links from HTML, then fetch and summarize both news and event pages.
-	"""
-	extracted = extract_news_and_event_urls(html=html, base_url=base_url, max_per_type=max_per_type)
-
-	news_urls = extracted.get("news_urls", [])
-	event_urls = extracted.get("event_urls", [])
-
-	news_result = _summarize_pages(urls=news_urls, kind="news", timeout_seconds=timeout_seconds)
-	event_result = _summarize_pages(urls=event_urls, kind="events", timeout_seconds=timeout_seconds)
-
-	final = EndToEndResult(
-		extracted=UrlExtractionResult.model_validate(extracted),
-		news=news_result,
-		events=event_result,
-	)
-	return final.model_dump(mode="json")
-
-
-@mcp.tool()
-def health() -> dict:
-	"""Simple health-check tool."""
-	return {"status": "ok"}
-
-
-def _parse_args() -> argparse.Namespace:
-	parser = argparse.ArgumentParser(description="FastMCP server for news and events processing")
-	parser.add_argument("--host", default="0.0.0.0", help="Host to bind")
-	parser.add_argument("--port", type=int, default=8000, help="Port to bind")
-	parser.add_argument("--path", default="/mcp", help="MCP HTTP path")
-	return parser.parse_args()
-
-
-def main() -> None:
-	args = _parse_args()
-
-	# Newer fastmcp versions commonly use streamable-http transport.
-	try:
-		mcp.run(transport="streamable-http", host=args.host, port=args.port, path=args.path)
-	except TypeError:
-		# Fallback for fastmcp variants with a different run signature.
-		mcp.run(host=args.host, port=args.port, path=args.path)
+def summarize_event_urls(input_data: UrlSummarizeInput) -> ContentBatchResult:
+    """Esemeny URL-ek letoltese, tartalomkinyerese es rovid osszefoglalasa."""
+    return _summarize_urls(input_data, kind="event")
 
 
 if __name__ == "__main__":
-	main()
+    mcp.run()
