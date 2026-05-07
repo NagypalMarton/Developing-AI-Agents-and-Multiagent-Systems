@@ -4,6 +4,7 @@ import os
 import re
 from typing import Literal
 from urllib.parse import urljoin, urlparse
+from datetime import datetime
 
 import requests
 from bs4 import BeautifulSoup, FeatureNotFound
@@ -25,7 +26,7 @@ DEFAULT_EVENT_KEYWORDS = [
     "borze",
     "konferencia",
 ]
-SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\\s+")
+SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 DATE_TIME_RE = re.compile(
     r"(\d{4}[./-]\d{1,2}[./-]\d{1,2}(?:\s+\d{1,2}:\d{2})?|\d{1,2}[./-]\d{1,2}[./-]\d{2,4}(?:\s+\d{1,2}:\d{2})?)"
 )
@@ -85,6 +86,7 @@ class DetectedPage(BaseModel):
     detected_author: str | None = None
     detected_text: str
     detected_datetime: str | None = None
+    detected_european_date: str | None = None
     detected_location: str | None = None
     detected_guests_list: list[str] = Field(default_factory=list)
     detected_registration: HttpUrl | None = None
@@ -233,13 +235,13 @@ def _extract_main_text(soup: BeautifulSoup) -> str | None:
                 if p.get_text(strip=True)
             ]
             if paragraphs:
-                text = "\\n".join(paragraphs)
+                text = "\n".join(paragraphs)
                 if len(text) >= 120:
                     return text
 
     paragraphs = [p.get_text(" ", strip=True) for p in soup.find_all("p") if p.get_text(strip=True)]
     if paragraphs:
-        return "\\n".join(paragraphs)
+        return "\n".join(paragraphs)
     return None
 
 
@@ -357,11 +359,52 @@ def _extract_event_registration(soup: BeautifulSoup, page_url: str) -> str | Non
     return None
 
 
+def _parse_to_yyyy_mm_dd(s: str | None) -> str | None:
+    if not s:
+        return None
+    s = s.strip()
+    # Try ISO first
+    try:
+        dt = datetime.fromisoformat(s)
+        return dt.strftime("%Y.%m.%d")
+    except Exception:
+        pass
+    # Try trailing Z
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return dt.strftime("%Y.%m.%d")
+    except Exception:
+        pass
+
+    # Extract a date-like substring
+    m = DATE_TIME_RE.search(s)
+    substr = m.group(1) if m else s
+
+    fmts = [
+        "%Y-%m-%dT%H:%M:%S%z",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d",
+        "%d.%m.%Y",
+        "%d/%m/%Y",
+        "%d-%m-%Y",
+        "%Y.%m.%d",
+        "%Y/%m/%d",
+    ]
+    for fmt in fmts:
+        try:
+            dt = datetime.strptime(substr, fmt)
+            return dt.strftime("%Y.%m.%d")
+        except Exception:
+            continue
+
+    return None
+
+
 def _make_summary(text: str | None, max_sentences: int) -> str | None:
     if not text:
         return None
 
-    normalized = re.sub(r"\\s+", " ", text).strip()
+    normalized = re.sub(r"\s+", " ", text).strip()
     if not normalized:
         return None
 
@@ -419,6 +462,7 @@ def _discover_text_and_detection(payload: UrlTextDetectionInput) -> UrlTextDetec
             text = _extract_main_text(soup) or ""
             author = _extract_author(soup)
             event_datetime = _extract_event_datetime(soup)
+            event_eu = _parse_to_yyyy_mm_dd(event_datetime)
             event_location = _extract_event_location(soup)
             event_guests = _extract_event_guests(soup)
             registration = _extract_event_registration(soup, page_url=url_str)
@@ -439,6 +483,7 @@ def _discover_text_and_detection(payload: UrlTextDetectionInput) -> UrlTextDetec
                     detected_author=author,
                     detected_text=text,
                     detected_datetime=event_datetime,
+                    detected_european_date=event_eu,
                     detected_location=event_location,
                     detected_guests_list=event_guests,
                     detected_registration=registration,
@@ -509,9 +554,49 @@ def _summarize_event_urls(payload: UrlSummarizeInput) -> EventBatchResult:
     )
 
 
+class TimestampItem(BaseModel):
+    timestamp: str | None = None
+    Timezone: str | None = None
+
+    class Config:
+        extra = "allow"
+
+
+class TimestampList(BaseModel):
+    __root__: list[TimestampItem]
+
+
+# Ensure MCP instance exists before using @mcp.tool() decorators
 mcp = FastMCP(name="NewsEventsAgent")
 
 
+@mcp.tool()
+def convert_timestamps_to_yyyy_mm_dd(input_data: TimestampList) -> list[str]:
+    """Átalakítja a bemeneti objektumok `timestamp` mezőjét és visszaadja
+    a `european_date` értékek listáját.
+
+    Bemenet: lista objektumokból (a megadott példa struktúrája).
+    Kimenet: lista stringekből, minden bemeneti elemhez egy `YYYY.MM.DD` formátumú
+    dátum (ha a timestamp hiányzik vagy nem értelmezhető, üres string kerül vissza).
+    """
+    out: list[str] = []
+    for item in input_data.__root__:
+        data_obj = item.model_dump() if hasattr(item, "model_dump") else item.dict()
+        ts = data_obj.get("timestamp")
+        if ts:
+            try:
+                dt = datetime.fromisoformat(ts)
+            except (ValueError, TypeError):
+                try:
+                    dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                except (ValueError, TypeError):
+                    out.append("")
+                    continue
+            date_str = dt.strftime("%Y.%m.%d")
+        else:
+            date_str = ""
+        out.append(date_str)
+    return out
 @mcp.tool()
 def discover_news_event_urls(input_data: UrlDiscoveryInput) -> UrlDiscoveryResult:
     """HTML oldalon URL-ek kigyujtese osztalyozas nelkul."""
