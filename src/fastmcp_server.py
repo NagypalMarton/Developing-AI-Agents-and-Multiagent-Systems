@@ -2,14 +2,14 @@ from __future__ import annotations
 
 import os
 import re
-from typing import Literal
+from typing import Literal, cast
 from urllib.parse import urljoin, urlparse
 from datetime import datetime
 
 import requests
 from bs4 import BeautifulSoup, FeatureNotFound
 from fastmcp import FastMCP
-from pydantic import BaseModel, Field, HttpUrl, model_validator
+from pydantic import BaseModel, Field, HttpUrl, RootModel, ConfigDict, model_validator
 
 
 DEFAULT_NEWS_KEYWORDS = ["hir", "news", "article", "cikk"]
@@ -151,7 +151,7 @@ def _parse_html(html: str) -> BeautifulSoup:
         return BeautifulSoup(html, "html.parser")
 
 
-def _normalize_url(href: str | None, base_url: str | None) -> str | None:
+def _normalize_url(href: str | None, base_url: str | None) -> HttpUrl | None:
     if not href:
         return None
 
@@ -160,11 +160,11 @@ def _normalize_url(href: str | None, base_url: str | None) -> str | None:
         return None
 
     if base_url:
-        return urljoin(base_url, href)
+        return cast(HttpUrl, urljoin(base_url, href))
 
     parsed = urlparse(href)
     if parsed.scheme in {"http", "https"}:
-        return href
+        return cast(HttpUrl, href)
     return None
 
 
@@ -345,7 +345,7 @@ def _extract_event_guests(soup: BeautifulSoup) -> list[str]:
     return unique_guests
 
 
-def _extract_event_registration(soup: BeautifulSoup, page_url: str) -> str | None:
+def _extract_event_registration(soup: BeautifulSoup, page_url: str) -> HttpUrl | None:
     registration_pattern = re.compile(r"register|registration|signup|ticket|book|jelentkez", re.I)
     for a_tag in soup.find_all("a"):
         href = a_tag.get("href")
@@ -354,7 +354,7 @@ def _extract_event_registration(soup: BeautifulSoup, page_url: str) -> str | Non
         anchor_text = a_tag.get_text(" ", strip=True)
         haystack = f"{href} {anchor_text}"
         if registration_pattern.search(haystack):
-            return urljoin(page_url, href.strip())
+            return cast(HttpUrl, urljoin(page_url, href.strip()))
 
     return None
 
@@ -427,7 +427,7 @@ def _discover_urls(payload: UrlDiscoveryInput) -> UrlDiscoveryResult:
     soup = _parse_html(html)
 
     scanned_links = 0
-    discovered_urls: list[str] = []
+    discovered_urls: list[HttpUrl] = []
 
     for a_tag in soup.find_all("a"):
         scanned_links += 1
@@ -435,7 +435,7 @@ def _discover_urls(payload: UrlDiscoveryInput) -> UrlDiscoveryResult:
         absolute_url = _normalize_url(href, base)
         if not absolute_url:
             continue
-        discovered_urls.append(absolute_url)
+            discovered_urls.append(absolute_url)
 
     unique_urls = sorted(set(discovered_urls))
 
@@ -555,15 +555,14 @@ def _summarize_event_urls(payload: UrlSummarizeInput) -> EventBatchResult:
 
 
 class TimestampItem(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     timestamp: str | None = None
     Timezone: str | None = None
 
-    class Config:
-        extra = "allow"
 
-
-class TimestampList(BaseModel):
-    __root__: list[TimestampItem]
+class TimestampList(RootModel[list[TimestampItem]]):
+    pass
 
 
 # Ensure MCP instance exists before using @mcp.tool() decorators
@@ -580,7 +579,7 @@ def convert_timestamps_to_yyyy_mm_dd(input_data: TimestampList) -> list[str]:
     dátum (ha a timestamp hiányzik vagy nem értelmezhető, üres string kerül vissza).
     """
     out: list[str] = []
-    for item in input_data.__root__:
+    for item in input_data.root:
         data_obj = item.model_dump() if hasattr(item, "model_dump") else item.dict()
         ts = data_obj.get("timestamp")
         if ts:
