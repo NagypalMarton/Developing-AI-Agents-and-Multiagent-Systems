@@ -9,7 +9,7 @@ from datetime import datetime
 import requests
 from bs4 import BeautifulSoup, FeatureNotFound
 from fastmcp import FastMCP
-from pydantic import BaseModel, Field, HttpUrl, RootModel, ConfigDict, model_validator
+from pydantic import BaseModel, Field, HttpUrl, model_validator
 
 
 DEFAULT_NEWS_KEYWORDS = ["hir", "news", "article", "cikk"]
@@ -45,6 +45,10 @@ class UrlDiscoveryInput(BaseModel):
         default=None,
         description="Relativ URL-ek feloldasahoz hasznalt bazis URL.",
     )
+    min_date: str | None = Field(
+        default=None,
+        description="Minimum datum (YYYY.MM.DD vagy YYYY-MM-DD formatumban). Csak az ennél nem régebbi linkeket adja vissza.",
+    )
 
     @model_validator(mode="after")
     def validate_source(self) -> "UrlDiscoveryInput":
@@ -57,6 +61,8 @@ class UrlDiscoveryResult(BaseModel):
     source_url: HttpUrl | None
     total_links_scanned: int
     discovered_urls: list[HttpUrl]
+    filtered_by_date: bool = False
+    applied_min_date: str | None = None
 
 
 class UrlSummarizeInput(BaseModel):
@@ -76,6 +82,10 @@ class UrlTextDetectionInput(BaseModel):
     event_keywords: list[str] = Field(
         default_factory=lambda: DEFAULT_EVENT_KEYWORDS.copy(),
         description="Kulcsszavak az esemeny tartalmak felismeresehez.",
+    )
+    min_date: str | None = Field(
+        default=None,
+        description="Minimum datum (YYYY.MM.DD vagy YYYY-MM-DD formatumban). Csak az ennél nem régebbi oldalakat dolgozza fel.",
     )
 
 
@@ -363,32 +373,26 @@ def _parse_to_yyyy_mm_dd(s: str | None) -> str | None:
     if not s:
         return None
     s = s.strip()
-    # Try ISO first
-    try:
-        dt = datetime.fromisoformat(s)
-        return dt.strftime("%Y.%m.%d")
-    except Exception:
-        pass
-    # Try trailing Z
-    try:
-        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
-        return dt.strftime("%Y.%m.%d")
-    except Exception:
-        pass
-
-    # Extract a date-like substring
+    
+    # Extract a date-like substring (csak dátum, az idő információkat figyelmen kívül hagyjuk)
     m = DATE_TIME_RE.search(s)
     substr = m.group(1) if m else s
 
     fmts = [
-        "%Y-%m-%dT%H:%M:%S%z",
-        "%Y-%m-%d %H:%M:%S",
         "%Y-%m-%d",
         "%d.%m.%Y",
         "%d/%m/%Y",
         "%d-%m-%Y",
         "%Y.%m.%d",
         "%Y/%m/%d",
+        "%Y.%b.%d",
+        "%Y.%B.%d",
+        "%d.%b.%Y",
+        "%d.%B.%Y",
+        "%Y-%b-%d",
+        "%Y-%B-%d",
+        "%d-%b-%Y",
+        "%d-%B-%Y",
     ]
     for fmt in fmts:
         try:
@@ -398,6 +402,26 @@ def _parse_to_yyyy_mm_dd(s: str | None) -> str | None:
             continue
 
     return None
+
+
+def _is_date_after_min_date(extracted_date: str | None, min_date: str | None) -> bool:
+    """Ellenőrzi, hogy az extracted_date nem régebbi-e, mint min_date.
+    Ha nincs extracted_date vagy min_date, True-t ad vissza (szűrés nélkül)."""
+    if not extracted_date or not min_date:
+        return True
+
+    try:
+        # Normalizáljuk mindkét dátumot YYYY.MM.DD formátumra
+        extracted_normalized = _parse_to_yyyy_mm_dd(extracted_date)
+        min_normalized = _parse_to_yyyy_mm_dd(min_date)
+
+        if not extracted_normalized or not min_normalized:
+            return True
+
+        # Stringként összehasonlítjuk (YYYY.MM.DD formátumban van)
+        return extracted_normalized >= min_normalized
+    except Exception:
+        return True
 
 
 def _make_summary(text: str | None, max_sentences: int) -> str | None:
@@ -435,7 +459,18 @@ def _discover_urls(payload: UrlDiscoveryInput) -> UrlDiscoveryResult:
         absolute_url = _normalize_url(href, base)
         if not absolute_url:
             continue
-            discovered_urls.append(absolute_url)
+
+        # Ha van min_date, szűrünk az URL szövegéből kinyert dátum alapján
+        if payload.min_date:
+            url_str = str(absolute_url)
+            extracted_date = DATE_TIME_RE.search(url_str)
+            if extracted_date:
+                date_from_url = extracted_date.group(1)
+                if not _is_date_after_min_date(date_from_url, payload.min_date):
+                    # Ez a link régebbi a min_date-nél, kihagyjuk
+                    continue
+
+        discovered_urls.append(absolute_url)
 
     unique_urls = sorted(set(discovered_urls))
 
@@ -443,6 +478,8 @@ def _discover_urls(payload: UrlDiscoveryInput) -> UrlDiscoveryResult:
         source_url=payload.page_url,
         total_links_scanned=scanned_links,
         discovered_urls=unique_urls,
+        filtered_by_date=bool(payload.min_date),
+        applied_min_date=payload.min_date,
     )
 
 
@@ -466,6 +503,14 @@ def _discover_text_and_detection(payload: UrlTextDetectionInput) -> UrlTextDetec
             event_location = _extract_event_location(soup)
             event_guests = _extract_event_guests(soup)
             registration = _extract_event_registration(soup, page_url=url_str)
+
+            # Ha van min_date szűrés, ellenőrizzük a dátumot
+            if payload.min_date:
+                # Próbálunk dátumot nyerni az event_datetime-ból vagy az URL-ből
+                date_to_check = event_datetime or url_str
+                if not _is_date_after_min_date(date_to_check, payload.min_date):
+                    # Ez az oldal régebbi a min_date-nél, kihagyjuk
+                    continue
 
             detected_type = _classify_page_content(
                 url=url_str,
@@ -554,48 +599,8 @@ def _summarize_event_urls(payload: UrlSummarizeInput) -> EventBatchResult:
     )
 
 
-class TimestampItem(BaseModel):
-    model_config = ConfigDict(extra="allow")
-
-    timestamp: str | None = None
-    Timezone: str | None = None
-
-
-class TimestampList(RootModel[list[TimestampItem]]):
-    pass
-
-
 # Ensure MCP instance exists before using @mcp.tool() decorators
 mcp = FastMCP(name="NewsEventsAgent")
-
-
-@mcp.tool()
-def convert_timestamps_to_yyyy_mm_dd(input_data: TimestampList) -> list[str]:
-    """Átalakítja a bemeneti objektumok `timestamp` mezőjét és visszaadja
-    a `european_date` értékek listáját.
-
-    Bemenet: lista objektumokból (a megadott példa struktúrája).
-    Kimenet: lista stringekből, minden bemeneti elemhez egy `YYYY.MM.DD` formátumú
-    dátum (ha a timestamp hiányzik vagy nem értelmezhető, üres string kerül vissza).
-    """
-    out: list[str] = []
-    for item in input_data.root:
-        data_obj = item.model_dump() if hasattr(item, "model_dump") else item.dict()
-        ts = data_obj.get("timestamp")
-        if ts:
-            try:
-                dt = datetime.fromisoformat(ts)
-            except (ValueError, TypeError):
-                try:
-                    dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-                except (ValueError, TypeError):
-                    out.append("")
-                    continue
-            date_str = dt.strftime("%Y.%m.%d")
-        else:
-            date_str = ""
-        out.append(date_str)
-    return out
 @mcp.tool()
 def discover_news_event_urls(input_data: UrlDiscoveryInput) -> UrlDiscoveryResult:
     """HTML oldalon URL-ek kigyujtese osztalyozas nelkul."""
