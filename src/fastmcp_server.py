@@ -169,12 +169,12 @@ def _normalize_url(href: str | None, base_url: str | None) -> HttpUrl | None:
     if href.startswith("javascript:") or href.startswith("#"):
         return None
 
-    if base_url:
-        return cast(HttpUrl, urljoin(base_url, href))
-
-    parsed = urlparse(href)
-    if parsed.scheme in {"http", "https"}:
-        return cast(HttpUrl, href)
+    # Resolve relative URLs when a base URL is provided, otherwise use href as-is
+    candidate = urljoin(base_url, href) if base_url else href
+    parsed = urlparse(candidate)
+    # Only accept http/https schemes for HttpUrl fields
+    if parsed.scheme and parsed.scheme.lower() in {"http", "https"}:
+        return cast(HttpUrl, candidate)
     return None
 
 
@@ -364,7 +364,10 @@ def _extract_event_registration(soup: BeautifulSoup, page_url: str) -> HttpUrl |
         anchor_text = a_tag.get_text(" ", strip=True)
         haystack = f"{href} {anchor_text}"
         if registration_pattern.search(haystack):
-            return cast(HttpUrl, urljoin(page_url, href.strip()))
+            candidate = urljoin(page_url, href.strip())
+            parsed = urlparse(candidate)
+            if parsed.scheme and parsed.scheme.lower() in {"http", "https"}:
+                return cast(HttpUrl, candidate)
 
     return None
 
