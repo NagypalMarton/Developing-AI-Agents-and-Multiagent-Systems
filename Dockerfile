@@ -7,6 +7,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY src ./src
 
+ENV FASTMCP_HOST=0.0.0.0
+ENV FASTMCP_PORT=8000
+ENV FASTMCP_PATH=/mcp
+
 EXPOSE 8000
 
-CMD ["python", "src/fastmcp_server.py", "--host", "0.0.0.0", "--port", "8000", "--path", "/mcp"]
+CMD ["python", "src/fastmcp_server.py"]

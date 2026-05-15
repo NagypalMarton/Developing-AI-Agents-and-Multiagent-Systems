@@ -9,7 +9,7 @@ from datetime import datetime
 import requests
 from bs4 import BeautifulSoup, FeatureNotFound
 from fastmcp import FastMCP
-from pydantic import BaseModel, Field, HttpUrl, model_validator
+from pydantic import BaseModel, Field, HttpUrl, ValidationError, model_validator
 
 
 DEFAULT_NEWS_KEYWORDS = ["hir", "news", "article", "cikk"]
@@ -110,6 +110,8 @@ class UrlTextDetectionResult(BaseModel):
 
 class NewsItem(BaseModel):
     news_title: str
+    news_author: str
+    # Deprecated: kept for backward compatibility with older clients.
     news_auther: str
     news_content: str
     news_url: HttpUrl
@@ -377,9 +379,10 @@ def _parse_to_yyyy_mm_dd(s: str | None) -> str | None:
         return None
     s = s.strip()
     
-    # Extract a date-like substring (csak dátum, az idő információkat figyelmen kívül hagyjuk)
+    # Extract a date-like substring and ignore optional time fragments.
     m = DATE_TIME_RE.search(s)
     substr = m.group(1) if m else s
+    substr = substr.split()[0]
 
     fmts = [
         "%Y-%m-%d",
@@ -401,30 +404,35 @@ def _parse_to_yyyy_mm_dd(s: str | None) -> str | None:
         try:
             dt = datetime.strptime(substr, fmt)
             return dt.strftime("%Y.%m.%d")
-        except Exception:
+        except ValueError:
             continue
 
     return None
 
 
 def _is_date_after_min_date(extracted_date: str | None, min_date: str | None) -> bool:
-    """Ellenőrzi, hogy az extracted_date nem régebbi-e, mint min_date.
-    Ha nincs extracted_date vagy min_date, True-t ad vissza (szűrés nélkül)."""
-    if not extracted_date or not min_date:
+    """Return True only if extracted_date is parseable and >= min_date.
+
+    Behavior:
+    - If min_date is missing, filtering is disabled and returns True.
+    - If min_date is present but invalid, raises ValueError.
+    - If extracted_date is missing/unparseable, returns False (fail-closed).
+    """
+    if not min_date:
         return True
+    min_normalized = _parse_to_yyyy_mm_dd(min_date)
+    if not min_normalized:
+        raise ValueError("Invalid min_date. Expected YYYY.MM.DD or YYYY-MM-DD.")
 
-    try:
-        # Normalizáljuk mindkét dátumot YYYY.MM.DD formátumra
-        extracted_normalized = _parse_to_yyyy_mm_dd(extracted_date)
-        min_normalized = _parse_to_yyyy_mm_dd(min_date)
+    if not extracted_date:
+        return False
 
-        if not extracted_normalized or not min_normalized:
-            return True
+    extracted_normalized = _parse_to_yyyy_mm_dd(extracted_date)
+    if not extracted_normalized:
+        return False
 
-        # Stringként összehasonlítjuk (YYYY.MM.DD formátumban van)
-        return extracted_normalized >= min_normalized
-    except Exception:
-        return True
+    # Lexicographic compare is safe for YYYY.MM.DD.
+    return extracted_normalized >= min_normalized
 
 
 def _make_summary(text: str | None, max_sentences: int) -> str | None:
@@ -463,15 +471,12 @@ def _discover_urls(payload: UrlDiscoveryInput) -> UrlDiscoveryResult:
         if not absolute_url:
             continue
 
-        # Ha van min_date, szűrünk az URL szövegéből kinyert dátum alapján
+        # If min_date is provided, keep only links whose embedded date is parseable
+        # and not older than min_date.
         if payload.min_date:
             url_str = str(absolute_url)
-            extracted_date = DATE_TIME_RE.search(url_str)
-            if extracted_date:
-                date_from_url = extracted_date.group(1)
-                if not _is_date_after_min_date(date_from_url, payload.min_date):
-                    # Ez a link régebbi a min_date-nél, kihagyjuk
-                    continue
+            if not _is_date_after_min_date(url_str, payload.min_date):
+                continue
 
         discovered_urls.append(absolute_url)
 
@@ -537,7 +542,7 @@ def _discover_text_and_detection(payload: UrlTextDetectionInput) -> UrlTextDetec
                     detected_registration=registration,
                 )
             )
-        except Exception as exc:  # noqa: BLE001
+        except (requests.RequestException, ValueError, TypeError, ValidationError) as exc:
             errors.append(f"{url} -> {exc}")
 
     return UrlTextDetectionResult(
@@ -558,13 +563,14 @@ def _summarize_news_urls(payload: UrlSummarizeInput) -> NewsBatchResult:
             summary = _make_summary(page.detected_text, payload.summary_sentence_count) or page.detected_text
             item = NewsItem(
                 news_title=page.detected_title or "N/A",
+                news_author=page.detected_author or "N/A",
                 news_auther=page.detected_author or "N/A",
                 news_content=summary or "N/A",
                 news_url=page.source_url,
                 news_image=None,
             )
             news_items.append(item)
-        except Exception as exc:  # noqa: BLE001
+        except (ValueError, TypeError, ValidationError) as exc:
             errors.append(f"{page.source_url} -> {exc}")
 
     return NewsBatchResult(
@@ -592,7 +598,7 @@ def _summarize_event_urls(payload: UrlSummarizeInput) -> EventBatchResult:
                 events_registration=page.detected_registration,
             )
             events_items.append(item)
-        except Exception as exc:  # noqa: BLE001
+        except (ValueError, TypeError, ValidationError) as exc:
             errors.append(f"{page.source_url} -> {exc}")
 
     return EventBatchResult(
