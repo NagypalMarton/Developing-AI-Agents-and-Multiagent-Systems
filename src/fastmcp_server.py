@@ -9,27 +9,79 @@ from datetime import datetime
 import requests
 from bs4 import BeautifulSoup, FeatureNotFound
 from fastmcp import FastMCP
-from pydantic import BaseModel, Field, HttpUrl, ValidationError, model_validator
+from pydantic import BaseModel, Field, HttpUrl, ValidationError, model_validator, TypeAdapter
+
+# Module-level HttpUrl adapter to validate/coerce URL strings without
+# recreating the adapter on each call.
+URL_ADAPTER = TypeAdapter(HttpUrl)
 
 
-DEFAULT_NEWS_KEYWORDS = ["hir", "news", "article", "cikk"]
-DEFAULT_EVENT_KEYWORDS = [
-    "esemeny",
-    "events",
-    "event",
-    "program",
-    "calendar",
-    "koncert",
-    "workshop",
-    "felhivas",
-    "börze",
-    "borze",
-    "konferencia",
+EVENT_CARD_SELECTORS = [
+    "div.views-view-responsive-grid__item-inner",
+    "div.event",
+]
+EVENT_TITLE_SELECTORS = [
+    ".bme_event_card-title",
+    ".event-title",
+    "h4.bme_event_card-title",
+]
+EVENT_TEXT_SELECTORS = [
+    ".bme_event_card-body",
+    ".event-body",
+]
+EVENT_DATE_SELECTORS = [
+    ".bme_event_card-date .nowrap",
+    ".event-date",
+]
+EVENT_LOCATION_SELECTORS = [
+    ".bme_event_card-location",
+]
+NEWS_CARD_SELECTORS = [
+    "div.bme_news_card",
+    "article.node-hir",
+    "div.news-item",
+]
+NEWS_TITLE_SELECTORS = [
+    ".bme_news_card-title",
+    "h2.node__title a",
+    "h2.news-title-important a",
+    ".news-title-important a",
+    "h4.bme_news_card-title",
+]
+NEWS_TEXT_SELECTORS = [
+    ".bme_news_card-body",
+    ".news-excerpt",
+    ".field--name-body",
+    ".field-name-body",
+]
+NEWS_DATE_SELECTORS = [
+    "datetime .field--name-created",
+    "span.field--name-created",
+    ".news-date",
+]
+NEWS_IMAGE_SELECTORS = [
+    ".bme_news_card-thumbnail img",
+    ".news-content img",
+    ".field-name-field-bevezto-kep img",
 ]
 SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 DATE_TIME_RE = re.compile(
-    r"(\d{4}[./-]\d{1,2}[./-]\d{1,2}(?:\s+\d{1,2}:\d{2})?|\d{1,2}[./-]\d{1,2}[./-]\d{2,4}(?:\s+\d{1,2}:\d{2})?)"
+    r"(\d{4}[./-]\s*\d{1,2}[./-]\s*\d{1,2}(?:\s+\d{1,2}:\d{2})?|\d{1,2}[./-]\s*\d{1,2}[./-]\s*\d{2,4}(?:\s+\d{1,2}:\d{2})?)"
 )
+HUNGARIAN_MONTHS = {
+    "január": "01",
+    "február": "02",
+    "március": "03",
+    "április": "04",
+    "május": "05",
+    "június": "06",
+    "július": "07",
+    "augusztus": "08",
+    "szeptember": "09",
+    "október": "10",
+    "november": "11",
+    "december": "12",
+}
 
 
 class UrlDiscoveryInput(BaseModel):
@@ -75,14 +127,6 @@ class UrlSummarizeInput(BaseModel):
 class UrlTextDetectionInput(BaseModel):
     urls: list[HttpUrl] = Field(description="Feldolgozando oldalak URL-jei.")
     max_items: int = Field(default=20, ge=1, le=200)
-    news_keywords: list[str] = Field(
-        default_factory=lambda: DEFAULT_NEWS_KEYWORDS.copy(),
-        description="Kulcsszavak a hir tartalmak felismeresehez.",
-    )
-    event_keywords: list[str] = Field(
-        default_factory=lambda: DEFAULT_EVENT_KEYWORDS.copy(),
-        description="Kulcsszavak az esemeny tartalmak felismeresehez.",
-    )
     min_date: str | None = Field(
         default=None,
         description="Minimum datum (YYYY.MM.DD vagy YYYY-MM-DD formatumban). Csak az ennél nem régebbi oldalakat dolgozza fel.",
@@ -95,6 +139,7 @@ class DetectedPage(BaseModel):
     detected_title: str
     detected_author: str | None = None
     detected_text: str
+    detected_image: HttpUrl | None = None
     detected_datetime: str | None = None
     detected_european_date: str | None = None
     detected_location: str | None = None
@@ -108,11 +153,12 @@ class UrlTextDetectionResult(BaseModel):
     errors: list[str]
 
 
+
 class NewsItem(BaseModel):
     news_title: str
     news_author: str
     # Deprecated: kept for backward compatibility with older clients.
-    news_auther: str
+    news_auther: str | None = None
     news_content: str
     news_url: HttpUrl
     news_image: HttpUrl | None = None
@@ -175,59 +221,113 @@ def _normalize_url(href: str | None, base_url: str | None) -> HttpUrl | None:
     candidate = urljoin(base_url, href) if base_url else href
     parsed = urlparse(candidate)
     # Only accept http/https schemes for HttpUrl fields
-    if parsed.scheme and parsed.scheme.lower() in {"http", "https"}:
-        return cast(HttpUrl, candidate)
+    if parsed.scheme and parsed.scheme.lower() in {"http", "https"} and parsed.netloc:
+        # Use Pydantic TypeAdapter to validate and coerce the URL into HttpUrl.
+        try:
+            validated = URL_ADAPTER.validate_python(candidate)
+            return validated
+        except ValidationError:
+            return None
     return None
 
 
-def _classify_link(url: str, anchor_text: str, news_keywords: list[str], event_keywords: list[str]) -> str | None:
-    url_haystack = f"{url} {urlparse(url).path}".lower()
-    anchor_haystack = anchor_text.lower()
 
-    if any(keyword.lower() in url_haystack for keyword in event_keywords):
-        return "event"
-
-    if any(keyword.lower() in url_haystack for keyword in news_keywords):
-        return "news"
-
-    if any(keyword.lower() in anchor_haystack for keyword in event_keywords):
-        return "event"
-
-    if any(keyword.lower() in anchor_haystack for keyword in news_keywords):
-        return "news"
-
+def _extract_first_selector_text(soup: BeautifulSoup, selectors: list[str]) -> str | None:
+    for selector in selectors:
+        element = soup.select_one(selector)
+        if element:
+            text = element.get_text(" ", strip=True)
+            if text:
+                return text
     return None
 
 
-def _classify_page_content(
-    url: str,
-    title: str | None,
-    text: str | None,
-    news_keywords: list[str],
-    event_keywords: list[str],
-) -> Literal["news", "event", "unknown"]:
-    text_sample = (text or "")[:4000]
-    haystack = f"{url} {title or ''} {text_sample}".lower()
+def _extract_first_selector_url(soup: BeautifulSoup, selectors: list[str], page_url: str) -> HttpUrl | None:
+    for selector in selectors:
+        element = soup.select_one(selector)
+        if not element:
+            continue
 
-    event_score = sum(1 for keyword in event_keywords if keyword.lower() in haystack)
-    news_score = sum(1 for keyword in news_keywords if keyword.lower() in haystack)
+        source = element.get("src") or element.get("href")
+        if source:
+            candidate = urljoin(page_url, source.strip())
+            parsed = urlparse(candidate)
+            if parsed.scheme and parsed.scheme.lower() in {"http", "https"}:
+                return cast(HttpUrl, candidate)
+    return None
 
-    if event_score > news_score and event_score > 0:
-        return "event"
 
-    if news_score > event_score and news_score > 0:
+def _has_news_structure(soup: BeautifulSoup) -> bool:
+    return any(soup.select_one(selector) for selector in NEWS_CARD_SELECTORS)
+
+
+def _has_event_structure(soup: BeautifulSoup) -> bool:
+    return any(soup.select_one(selector) for selector in EVENT_CARD_SELECTORS)
+
+
+def _extract_news_title(soup: BeautifulSoup) -> str | None:
+    title = _extract_first_selector_text(soup, NEWS_TITLE_SELECTORS)
+    if title:
+        return title
+    return _extract_title(soup)
+
+
+def _extract_news_text(soup: BeautifulSoup) -> str | None:
+    text = _extract_first_selector_text(soup, NEWS_TEXT_SELECTORS)
+    if text:
+        return text
+
+    article = soup.find("article", class_=re.compile(r"node-hir|node-promoted|node-teaser", re.I))
+    if article:
+        paragraphs = [p.get_text(" ", strip=True) for p in article.find_all("p") if p.get_text(strip=True)]
+        if paragraphs:
+            return "\n".join(paragraphs)
+
+    return _extract_main_text(soup)
+
+
+def _extract_news_datetime(soup: BeautifulSoup) -> str | None:
+    date_text = _extract_first_selector_text(soup, NEWS_DATE_SELECTORS)
+    if date_text:
+        return date_text
+    return _extract_event_datetime(soup)
+
+
+def _extract_news_image(soup: BeautifulSoup, page_url: str) -> HttpUrl | None:
+    return _extract_first_selector_url(soup, NEWS_IMAGE_SELECTORS, page_url)
+
+
+def _extract_event_title(soup: BeautifulSoup) -> str | None:
+    title = _extract_first_selector_text(soup, EVENT_TITLE_SELECTORS)
+    if title:
+        return title
+    return _extract_title(soup)
+
+
+def _extract_event_text(soup: BeautifulSoup) -> str | None:
+    text = _extract_first_selector_text(soup, EVENT_TEXT_SELECTORS)
+    if text:
+        return text
+    return _extract_main_text(soup)
+
+
+def _extract_event_date_text(soup: BeautifulSoup) -> str | None:
+    date_text = _extract_first_selector_text(soup, EVENT_DATE_SELECTORS)
+    if date_text:
+        return date_text
+    return _extract_event_datetime(soup)
+
+
+def _extract_event_card_location(soup: BeautifulSoup) -> str | None:
+    location = _extract_first_selector_text(soup, EVENT_LOCATION_SELECTORS)
+    if location:
+        return location
+    return _extract_event_location(soup)
+
+
+def _classify_page_content(soup: BeautifulSoup | None = None) -> Literal["news", "event", "unknown"]:
+    if soup and _has_news_structure(soup):
         return "news"
-
-    tie_breaker = _classify_link(
-        url=url,
-        anchor_text=title or "",
-        news_keywords=news_keywords,
-        event_keywords=event_keywords,
-    )
-    if tie_breaker == "news":
-        return "news"
-    if tie_breaker == "event":
-        return "event"
 
     return "unknown"
 
@@ -378,11 +478,28 @@ def _parse_to_yyyy_mm_dd(s: str | None) -> str | None:
     if not s:
         return None
     s = s.strip()
+
+    normalized_text = s.lower()
+    for month_name, month_number in HUNGARIAN_MONTHS.items():
+        normalized_text = normalized_text.replace(month_name, month_number)
+    normalized_text = re.sub(r"\s+", " ", normalized_text)
+
+    # First handle event-like date strings with loose separators, e.g.
+    # "2026. 05. 15. - 20:00" or "2026. 05 15.".
+    loose_match = re.search(r"(\d{4})\D+(\d{1,2})\D+(\d{1,2})", normalized_text)
+    if loose_match:
+        year, month, day = loose_match.groups()
+        candidate = f"{year}.{int(month):02d}.{int(day):02d}"
+        try:
+            dt = datetime.strptime(candidate, "%Y.%m.%d")
+            return dt.strftime("%Y.%m.%d")
+        except ValueError:
+            pass
     
     # Extract a date-like substring and ignore optional time fragments.
-    m = DATE_TIME_RE.search(s)
-    substr = m.group(1) if m else s
-    substr = substr.split()[0]
+    m = DATE_TIME_RE.search(normalized_text)
+    substr = m.group(1) if m else normalized_text
+    substr = re.sub(r"\s+", "", substr).rstrip(".-/")
 
     fmts = [
         "%Y-%m-%d",
@@ -406,6 +523,16 @@ def _parse_to_yyyy_mm_dd(s: str | None) -> str | None:
             return dt.strftime("%Y.%m.%d")
         except ValueError:
             continue
+
+    # Try again after coercing YYYYMMDD-like strings into dotted form.
+    compact_match = re.fullmatch(r"(\d{4})(\d{2})(\d{1,2})", substr)
+    if compact_match:
+        year, month, day = compact_match.groups()
+        try:
+            dt = datetime.strptime(f"{year}.{month}.{day}", "%Y.%m.%d")
+            return dt.strftime("%Y.%m.%d")
+        except ValueError:
+            pass
 
     return None
 
@@ -503,12 +630,32 @@ def _discover_text_and_detection(payload: UrlTextDetectionInput) -> UrlTextDetec
             html = _fetch_html(url_str)
             soup = _parse_html(html)
 
-            title = _extract_title(soup) or "N/A"
-            text = _extract_main_text(soup) or ""
+            is_news_structure = _has_news_structure(soup)
+            is_event_structure = _has_event_structure(soup)
+
+            if is_news_structure:
+                title = _extract_news_title(soup) or "N/A"
+                text = _extract_news_text(soup) or ""
+                page_image = _extract_news_image(soup, page_url=url_str)
+                page_datetime = _extract_news_datetime(soup)
+                page_location = _extract_event_location(soup)
+            elif is_event_structure:
+                title = _extract_event_title(soup) or "N/A"
+                text = _extract_event_text(soup) or ""
+                page_image = None
+                page_datetime = _extract_event_date_text(soup)
+                page_location = _extract_event_card_location(soup)
+            else:
+                title = _extract_title(soup) or "N/A"
+                text = _extract_main_text(soup) or ""
+                page_image = None
+                page_datetime = _extract_event_datetime(soup)
+                page_location = _extract_event_location(soup)
+
             author = _extract_author(soup)
-            event_datetime = _extract_event_datetime(soup)
+            event_datetime = page_datetime
             event_eu = _parse_to_yyyy_mm_dd(event_datetime)
-            event_location = _extract_event_location(soup)
+            event_location = page_location
             event_guests = _extract_event_guests(soup)
             registration = _extract_event_registration(soup, page_url=url_str)
 
@@ -520,13 +667,12 @@ def _discover_text_and_detection(payload: UrlTextDetectionInput) -> UrlTextDetec
                     # Ez az oldal régebbi a min_date-nél, kihagyjuk
                     continue
 
-            detected_type = _classify_page_content(
-                url=url_str,
-                title=title,
-                text=text,
-                news_keywords=payload.news_keywords,
-                event_keywords=payload.event_keywords,
-            )
+            detected_type = _classify_page_content(soup=soup)
+
+            if is_news_structure:
+                detected_type = "news"
+            elif is_event_structure:
+                detected_type = "event"
 
             detected_pages.append(
                 DetectedPage(
@@ -535,6 +681,7 @@ def _discover_text_and_detection(payload: UrlTextDetectionInput) -> UrlTextDetec
                     detected_title=title,
                     detected_author=author,
                     detected_text=text,
+                    detected_image=page_image,
                     detected_datetime=event_datetime,
                     detected_european_date=event_eu,
                     detected_location=event_location,
@@ -567,7 +714,7 @@ def _summarize_news_urls(payload: UrlSummarizeInput) -> NewsBatchResult:
                 news_auther=page.detected_author or "N/A",
                 news_content=summary or "N/A",
                 news_url=page.source_url,
-                news_image=None,
+                news_image=page.detected_image,
             )
             news_items.append(item)
         except (ValueError, TypeError, ValidationError) as exc:
