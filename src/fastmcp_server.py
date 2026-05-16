@@ -9,6 +9,9 @@ from bs4 import BeautifulSoup
 import requests
 from mcp.server import Server
 from mcp.types import Tool, TextContent, ToolResult
+from fastapi import FastAPI
+from fastapi.responses import StreamingResponse
+import uvicorn
 
 # ============================================================================
 # PYDANTIC SCHEMAS
@@ -650,10 +653,105 @@ async def enrich_with_registration_link(
 # SERVER RUN
 # ============================================================================
 
-async def main():
-    """MCP szerver futtatása stdio protokollon"""
-    async with server:
-        await server.wait_closed()
+# FastAPI app HTTP JSON-RPC wrapper MCP szerverhez
+app = FastAPI(
+    title="News to Social Media MCP Server",
+    description="MCP szerver HTTP JSON-RPC wrapper-rel - n8n kompatibilis",
+    version="1.0.0"
+)
+
+class ToolRequest(BaseModel):
+    """Tool hívás request"""
+    name: str
+    arguments: Dict[str, Any]
+
+class ToolResponse(BaseModel):
+    """Tool response"""
+    status: str
+    result: Optional[Dict[str, Any]] = None
+    error: Optional[str] = None
+
+@app.get("/")
+async def root():
+    """Root endpoint"""
+    return {
+        "status": "running",
+        "service": "News to Social Media MCP Server",
+        "version": "1.0.0",
+        "mcp_endpoint": "http://fastmcp-server:8000/mcp/tool"
+    }
+
+@app.get("/health")
+async def health():
+    """Health check"""
+    return {"status": "healthy"}
+
+@app.get("/mcp/tools")
+async def list_tools_api():
+    """Elérhető MCP toolok listája"""
+    tools = await list_mcp_tools()
+    return {
+        "tools": [
+            {
+                "name": t.name,
+                "description": t.description,
+                "inputSchema": t.inputSchema
+            }
+            for t in tools
+        ]
+    }
+
+@app.post("/mcp/tool", response_model=ToolResponse)
+async def call_tool_api(request: ToolRequest):
+    """
+    MCP Tool hívás HTTP JSON-RPC protokollon
+    
+    Használat az n8n-ben:
+    POST http://fastmcp-server:8000/mcp/tool
+    
+    Body:
+    {
+        "name": "parse_html_and_extract_news",
+        "arguments": {
+            "html_content": "...",
+            "source_url": "..."
+        }
+    }
+    """
+    try:
+        result = await call_mcp_tool(request.name, request.arguments)
+        
+        # Szöveges konverzió ha szükséges
+        if result.isError:
+            error_text = "Unknown error"
+            if result.content and len(result.content) > 0:
+                error_text = result.content[0].text if hasattr(result.content[0], 'text') else str(result.content[0])
+            return ToolResponse(status="error", error=error_text)
+        
+        # Sikeres hívás
+        result_text = ""
+        if result.content and len(result.content) > 0:
+            result_text = result.content[0].text if hasattr(result.content[0], 'text') else str(result.content[0])
+        
+        try:
+            result_json = json.loads(result_text)
+        except:
+            result_json = {"raw_result": result_text}
+        
+        return ToolResponse(status="success", result=result_json)
+    
+    except Exception as e:
+        return ToolResponse(status="error", error=str(e))
+
+async def run_server():
+    """HTTP szerver indítása"""
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=8000,
+        log_level="info"
+    )
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # HTTP mode - n8n JSON-RPC wrapper-rel
+    asyncio.run(run_server())
