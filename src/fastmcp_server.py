@@ -797,58 +797,124 @@ def _discover_text_and_detection(payload: UrlTextDetectionInput) -> UrlTextDetec
             is_news_structure = _has_news_structure(soup)
             is_event_structure = _has_event_structure(soup)
 
+            # Process individual news cards if news structure detected
             if is_news_structure:
-                title, text, page_image, page_datetime, page_location = _extract_news_page_data(soup, url_str)
-                title = title or "N/A"
-                text = text or ""
-            elif is_event_structure:
-                title, text, page_image, page_datetime, page_location = _extract_event_page_data(soup)
-                title = title or "N/A"
-                text = text or ""
+                news_cards = soup.select('div.bme_news_card')
+                for idx, card in enumerate(news_cards):
+                    title = _extract_first_selector_text(card, NEWS_TITLE_SELECTORS) or "N/A"  # type: ignore
+                    text = _extract_first_selector_text(card, NEWS_TEXT_SELECTORS) or ""  # type: ignore
+                    page_image = _extract_first_selector_url(card, NEWS_IMAGE_SELECTORS, url_str)  # type: ignore
+                    page_datetime = _extract_first_selector_text(card, NEWS_DATE_SELECTORS)  # type: ignore
+                    author = _extract_first_selector_text(card, ["span.field--name-created", ".news-author"])  # type: ignore
+                    
+                    # Try to extract card URL
+                    card_link = card.find("a")
+                    card_url = url_str
+                    if card_link and card_link.get("href"):
+                        card_url_path = card_link.get("href")
+                        card_url_str = _coerce_attribute_text(card_url_path)
+                        if card_url_str:
+                            card_url = _normalize_url(card_url_str, url_str) or url_str
+
+                    # NOTE: Don't filter news by min_date - let downstream (n8n) handle date filtering
+                    # if payload.min_date:
+                    #     if not _is_any_date_after_min_date([page_datetime, url_str], payload.min_date):
+                    #         print(f"[DEBUG] Card {idx} SKIPPED (date filter)", file=sys.stderr)
+                    #         continue
+
+                    event_eu = _parse_to_yyyy_mm_dd(page_datetime)
+                    detected_pages.append(
+                        DetectedPage(
+                            source_url=HttpUrl(str(card_url)),
+                            detected_type="news",
+                            detected_title=title,
+                            detected_author=author,
+                            detected_text=text,
+                            detected_image=page_image,
+                            detected_datetime=page_datetime,
+                            detected_european_date=event_eu,
+                            detected_location=None,
+                            detected_guests_list=[],
+                            detected_registration=None,
+                        )
+                    )
+
+            # Process individual event cards if event structure detected
+            if is_event_structure:
+                event_cards = soup.select('div.views-view-responsive-grid__item-inner')
+                for card in event_cards:
+                    title = _extract_first_selector_text(card, EVENT_TITLE_SELECTORS) or "N/A"  # type: ignore
+                    text = _extract_first_selector_text(card, EVENT_TEXT_SELECTORS) or ""  # type: ignore
+                    page_datetime = _extract_first_selector_text(card, EVENT_DATE_SELECTORS)  # type: ignore
+                    page_location = _extract_first_selector_text(card, EVENT_LOCATION_SELECTORS)  # type: ignore
+                    event_guests = _extract_first_selector_text(card, ["span.guests", ".event-guests"])  # type: ignore
+                    registration_str = _extract_first_selector_text(card, ["a.register", ".registration-link"])  # type: ignore
+                    registration = HttpUrl(registration_str) if registration_str else None
+                    
+                    # Try to extract card URL
+                    card_link = card.find("a")
+                    card_url = url_str
+                    if card_link and card_link.get("href"):
+                        card_url_path = card_link.get("href")
+                        card_url_str = _coerce_attribute_text(card_url_path)
+                        if card_url_str:
+                            card_url = _normalize_url(card_url_str, url_str) or url_str
+
+                    # NOTE: Don't filter events by min_date - let downstream (n8n) handle date filtering
+                    # if payload.min_date:
+                    #     if not _is_any_date_after_min_date([page_datetime], payload.min_date):
+                    #         continue
+
+                    event_eu = _parse_to_yyyy_mm_dd(page_datetime)
+                    detected_pages.append(
+                        DetectedPage(
+                            source_url=HttpUrl(str(card_url)),
+                            detected_type="event",
+                            detected_title=title,
+                            detected_author=None,
+                            detected_text=text,
+                            detected_image=None,
+                            detected_datetime=page_datetime,
+                            detected_european_date=event_eu,
+                            detected_location=page_location,
+                            detected_guests_list=[event_guests] if event_guests else [],
+                            detected_registration=registration,
+                        )
+                    )
+
             else:
+                # Unknown page type - extract generic page data
                 title = _extract_title(soup) or "N/A"
                 text = _extract_main_text(soup) or ""
                 page_image = _extract_page_image(soup, url_str)
                 page_datetime = _extract_event_datetime(soup)
                 page_location = _extract_event_location(soup)
+                author = _extract_author(soup)
+                event_guests = _extract_event_guests(soup)
+                registration = _extract_event_registration(soup, page_url=url_str)
 
-            author = _extract_author(soup)
-            event_datetime = page_datetime
-            event_eu = _parse_to_yyyy_mm_dd(event_datetime)
-            event_location = page_location
-            event_guests = _extract_event_guests(soup)
-            registration = _extract_event_registration(soup, page_url=url_str)
+                # Apply date filter for unknown pages
+                if payload.min_date:
+                    if not _is_any_date_after_min_date([page_datetime, url_str], payload.min_date):
+                        continue
 
-            # Only apply date filter if detected_type would be "unknown"
-            # For news/event, we skip the date filter since we don't reliably extract dates
-            if payload.min_date and not (is_news_structure or is_event_structure):
-                if not _is_any_date_after_min_date([event_datetime, url_str], payload.min_date):
-                    continue
-
-            detected_type = _classify_page_content(soup=soup)
-
-            if is_news_structure:
-                detected_type = "news"
-            elif is_event_structure:
-                detected_type = "event"
-            else:
-                detected_type = "unknown"
-
-            detected_pages.append(
-                DetectedPage(
-                    source_url=url,
-                    detected_type=detected_type,
-                    detected_title=title,
-                    detected_author=author,
-                    detected_text=text,
-                    detected_image=page_image,
-                    detected_datetime=event_datetime,
-                    detected_european_date=event_eu,
-                    detected_location=event_location,
-                    detected_guests_list=event_guests,
-                    detected_registration=registration,
+                event_eu = _parse_to_yyyy_mm_dd(page_datetime)
+                detected_pages.append(
+                    DetectedPage(
+                        source_url=url,
+                        detected_type="unknown",
+                        detected_title=title,
+                        detected_author=author,
+                        detected_text=text,
+                        detected_image=page_image,
+                        detected_datetime=page_datetime,
+                        detected_european_date=event_eu,
+                        detected_location=page_location,
+                        detected_guests_list=event_guests,
+                        detected_registration=registration,
+                    )
                 )
-            )
+
         except (requests.RequestException, ValueError, TypeError, ValidationError) as exc:
             errors.append(_make_tool_error("discover_text_and_detection_from_url", exc, url=url_str))
 
