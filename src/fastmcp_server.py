@@ -83,6 +83,21 @@ HUNGARIAN_MONTHS = {
     "december": "12",
 }
 
+ENGLISH_MONTHS = {
+    "january": "01",
+    "february": "02",
+    "march": "03",
+    "april": "04",
+    "may": "05",
+    "june": "06",
+    "july": "07",
+    "august": "08",
+    "september": "09",
+    "october": "10",
+    "november": "11",
+    "december": "12",
+}
+
 
 class UrlDiscoveryInput(BaseModel):
     page_url: HttpUrl | None = Field(
@@ -99,7 +114,7 @@ class UrlDiscoveryInput(BaseModel):
     )
     min_date: str | None = Field(
         default=None,
-        description="Minimum datum (YYYY.MM.DD vagy YYYY-MM-DD formatumban). Csak az ennél nem régebbi linkeket adja vissza.",
+        description="Minimum datum (YYYY.MM.DD vagy YYYY-MM-DD formatumban). Csak az ennél nem regebbi (URL-ben vagy a talalt HTML blokkban datalhato) linkeket adja vissza.",
     )
 
     @model_validator(mode="after")
@@ -254,6 +269,47 @@ def _extract_first_selector_url(soup: BeautifulSoup, selectors: list[str], page_
             parsed = urlparse(candidate)
             if parsed.scheme and parsed.scheme.lower() in {"http", "https"}:
                 return cast(HttpUrl, candidate)
+    return None
+
+
+def _extract_date_from_link_context(a_tag) -> str | None:
+    containers = [
+        a_tag,
+        a_tag.find_parent("article"),
+        a_tag.find_parent("li"),
+        a_tag.find_parent("div"),
+    ]
+
+    seen_ids: set[int] = set()
+    for container in containers:
+        if container is None:
+            continue
+        container_id = id(container)
+        if container_id in seen_ids:
+            continue
+        seen_ids.add(container_id)
+
+        time_tag = container.find("time")
+        if time_tag:
+            if time_tag.get("datetime"):
+                return str(time_tag["datetime"]).strip()
+            time_text = time_tag.get_text(" ", strip=True)
+            if time_text:
+                return time_text
+
+        for selector in NEWS_DATE_SELECTORS + EVENT_DATE_SELECTORS:
+            node = container.select_one(selector)
+            if node:
+                node_text = node.get_text(" ", strip=True)
+                if node_text:
+                    return node_text
+
+        container_text = container.get_text(" ", strip=True)
+        if container_text:
+            matched = DATE_TIME_RE.search(container_text)
+            if matched:
+                return matched.group(1)
+
     return None
 
 
@@ -482,6 +538,8 @@ def _parse_to_yyyy_mm_dd(s: str | None) -> str | None:
     normalized_text = s.lower()
     for month_name, month_number in HUNGARIAN_MONTHS.items():
         normalized_text = normalized_text.replace(month_name, month_number)
+    for month_name, month_number in ENGLISH_MONTHS.items():
+        normalized_text = normalized_text.replace(month_name, month_number)
     normalized_text = re.sub(r"\s+", " ", normalized_text)
 
     # First handle event-like date strings with loose separators, e.g.
@@ -602,7 +660,16 @@ def _discover_urls(payload: UrlDiscoveryInput) -> UrlDiscoveryResult:
         # and not older than min_date.
         if payload.min_date:
             url_str = str(absolute_url)
-            if not _is_date_after_min_date(url_str, payload.min_date):
+            context_date = _extract_date_from_link_context(a_tag)
+
+            is_url_recent = _is_date_after_min_date(url_str, payload.min_date)
+            is_context_recent = (
+                _is_date_after_min_date(context_date, payload.min_date)
+                if context_date
+                else False
+            )
+
+            if not (is_url_recent or is_context_recent):
                 continue
 
         discovered_urls.append(absolute_url)
