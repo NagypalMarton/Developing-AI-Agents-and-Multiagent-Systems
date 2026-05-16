@@ -155,7 +155,7 @@ class DetectedPage(BaseModel):
     detected_author: str | None = None
     detected_text: str
     detected_image: HttpUrl | None = None
-    detected_datetime: str | None = None
+    detected_datetime: str
     detected_european_date: str | None = None
     detected_location: str | None = None
     detected_guests_list: list[str] = Field(default_factory=list)
@@ -174,7 +174,7 @@ class NewsItem(BaseModel):
     news_author: str
     # Deprecated: kept for backward compatibility with older clients.
     news_auther: str | None = None
-    news_content: str
+    news_content_summary: str
     news_url: HttpUrl
     news_image: HttpUrl | None = None
 
@@ -779,7 +779,7 @@ def _summarize_news_urls(payload: UrlSummarizeInput) -> NewsBatchResult:
                 news_title=page.detected_title or "N/A",
                 news_author=page.detected_author or "N/A",
                 news_auther=page.detected_author or "N/A",
-                news_content=summary or "N/A",
+                news_content_summary=summary or "N/A",
                 news_url=page.source_url,
                 news_image=page.detected_image,
             )
