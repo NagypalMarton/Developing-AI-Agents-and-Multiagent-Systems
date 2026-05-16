@@ -1,4 +1,4 @@
-import asyncio
+ 
 import json
 import re
 from datetime import datetime
@@ -774,10 +774,9 @@ async def call_tool_api(request: ToolRequest):
     except Exception as e:
         return ToolResponse(status="error", error=str(e))
 
-async def run_server():
-    """HTTP szerver indítása"""
-    # Uvicorn nem lehet async context-ben futtatva
-    # Ezért direkt hívjuk meg, nem await-vel
+def run_server():
+    """HTTP szerver indítása (szinkron)"""
+    # Uvicorn saját event loop-ot kezel; futtatjuk szinkron módon
     uvicorn.run(
         app,
         host="0.0.0.0",
@@ -786,5 +785,5 @@ async def run_server():
     )
 
 if __name__ == "__main__":
-    # Nem asyncio.run()-t használunk, mert az uvicorn már saját event loop-ot kezel
+    # Indítsuk el a HTTP szervert
     run_server()
