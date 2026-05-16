@@ -692,7 +692,7 @@ app = FastAPI(
 class ToolRequest(BaseModel):
     """Tool hívás request"""
     name: str
-    arguments: Dict[str, Any]
+    arguments: Dict[str, Any] = Field(default_factory=dict)
 
 class ToolResponse(BaseModel):
     """Tool response"""
