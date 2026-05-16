@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 from bs4 import BeautifulSoup
 import requests
 from mcp.server import Server
-from mcp.types import Tool, TextContent, ToolResult
+from mcp.types import Tool, TextContent
 from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
 import uvicorn
@@ -347,7 +347,7 @@ async def list_mcp_tools() -> list[Tool]:
     ]
 
 @server.call_tool()
-async def call_mcp_tool(name: str, arguments: dict) -> ToolResult:
+async def call_mcp_tool(name: str, arguments: dict) -> dict:
     """Handle MCP tool calls"""
     try:
         if name == "parse_html_and_extract_news":
@@ -375,21 +375,21 @@ async def call_mcp_tool(name: str, arguments: dict) -> ToolResult:
                 arguments.get("platform", "")
             )
         else:
-            return ToolResult(
-                isError=True,
-                content=[TextContent(type="text", text=f"Unknown tool: {name}")]
-            )
+            return {
+                "isError": True,
+                "content": [{"type": "text", "text": f"Unknown tool: {name}"}]
+            }
         
-        return ToolResult(
-            isError=False,
-            content=[TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
-        )
+        return {
+            "isError": False,
+            "content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False, indent=2)}]
+        }
     
     except Exception as e:
-        return ToolResult(
-            isError=True,
-            content=[TextContent(type="text", text=f"Error: {str(e)}")]
-        )
+        return {
+            "isError": True,
+            "content": [{"type": "text", "text": f"Error: {str(e)}"}]
+        }
 
 async def parse_html_and_extract_news(html_content: str, source_url: str) -> Dict[str, Any]:
     """
@@ -722,16 +722,18 @@ async def call_tool_api(request: ToolRequest):
         result = await call_mcp_tool(request.name, request.arguments)
         
         # Szöveges konverzió ha szükséges
-        if result.isError:
+        if result.get("isError", False):
             error_text = "Unknown error"
-            if result.content and len(result.content) > 0:
-                error_text = result.content[0].text if hasattr(result.content[0], 'text') else str(result.content[0])
+            content = result.get("content", [])
+            if content and len(content) > 0:
+                error_text = content[0].get("text", "Unknown error") if isinstance(content[0], dict) else str(content[0])
             return ToolResponse(status="error", error=error_text)
         
         # Sikeres hívás
         result_text = ""
-        if result.content and len(result.content) > 0:
-            result_text = result.content[0].text if hasattr(result.content[0], 'text') else str(result.content[0])
+        content = result.get("content", [])
+        if content and len(content) > 0:
+            result_text = content[0].get("text", "") if isinstance(content[0], dict) else str(content[0])
         
         try:
             result_json = json.loads(result_text)
