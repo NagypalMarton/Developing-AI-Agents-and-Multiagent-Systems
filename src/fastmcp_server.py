@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 from bs4 import BeautifulSoup
 from mcp.server import Server
 from mcp.types import Tool, TextContent
-from fastapi import FastAPI
+from fastapi import FastAPI, Body
 from fastapi.responses import StreamingResponse
 import uvicorn
 
@@ -731,7 +731,7 @@ async def list_tools_api():
     }
 
 @app.post("/mcp/tool", response_model=ToolResponse)
-async def call_tool_api(request: ToolRequest):
+async def call_tool_api(raw_request: dict = Body(...)):
     """
     MCP Tool hívás HTTP JSON-RPC protokollon
     
@@ -748,7 +748,14 @@ async def call_tool_api(request: ToolRequest):
     }
     """
     try:
-        result = await call_mcp_tool(request.name, request.arguments)
+        # Accept arbitrary JSON from clients (avoid FastAPI 422 on unexpected bodies)
+        name = raw_request.get("name")
+        arguments = raw_request.get("arguments", {})
+
+        if not name or not isinstance(name, str):
+            return ToolResponse(status="error", error="Invalid request: 'name' (string) is required")
+
+        result = await call_mcp_tool(name, arguments)
         
         # Szöveges konverzió ha szükséges
         if result.get("isError", False):
