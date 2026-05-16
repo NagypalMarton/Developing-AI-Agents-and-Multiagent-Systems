@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import re
 from typing import Literal, cast
 from urllib.parse import urljoin, urlparse
@@ -165,6 +164,8 @@ class DetectedPage(BaseModel):
     detected_location: str | None = None
     detected_guests_list: list[str] = Field(default_factory=list)
     detected_registration: HttpUrl | None = None
+    detected_confidence: float | None = None
+    detected_reason: str | None = None
 
 
 class UrlTextDetectionResult(BaseModel):
@@ -177,8 +178,6 @@ class UrlTextDetectionResult(BaseModel):
 class NewsItem(BaseModel):
     news_title: str
     news_author: str
-    # Deprecated: kept for backward compatibility with older clients.
-    news_auther: str | None = None
     news_content_summary: str
     news_url: HttpUrl
     news_image: HttpUrl | None = None
@@ -386,6 +385,21 @@ def _extract_news_image(soup: BeautifulSoup, page_url: str) -> HttpUrl | None:
     return _extract_first_selector_url(soup, NEWS_IMAGE_SELECTORS, page_url)
 
 
+def _extract_page_image(soup: BeautifulSoup, page_url: str) -> HttpUrl | None:
+    og_image = soup.find("meta", attrs={"property": "og:image"})
+    og_image_content = _coerce_attribute_text(og_image.get("content")) if og_image else None
+    if og_image_content:
+        return _normalize_url(og_image_content, page_url)
+
+    image = soup.find("img")
+    if image:
+        source_text = _coerce_attribute_text(image.get("src"))
+        if source_text:
+            return _normalize_url(source_text, page_url)
+
+    return None
+
+
 def _extract_event_title(soup: BeautifulSoup) -> str | None:
     title = _extract_first_selector_text(soup, EVENT_TITLE_SELECTORS)
     if title:
@@ -414,7 +428,30 @@ def _extract_event_card_location(soup: BeautifulSoup) -> str | None:
     return _extract_event_location(soup)
 
 
+def _extract_news_page_data(soup: BeautifulSoup, page_url: str) -> tuple[str | None, str | None, HttpUrl | None, str | None, str | None]:
+    return (
+        _extract_news_title(soup),
+        _extract_news_text(soup),
+        _extract_news_image(soup, page_url=page_url),
+        _extract_news_datetime(soup),
+        None,
+    )
+
+
+def _extract_event_page_data(soup: BeautifulSoup, page_url: str) -> tuple[str | None, str | None, HttpUrl | None, str | None, str | None]:
+    return (
+        _extract_event_title(soup),
+        _extract_event_text(soup),
+        None,
+        _extract_event_date_text(soup),
+        _extract_event_card_location(soup),
+    )
+
+
 def _classify_page_content(soup: BeautifulSoup | None = None) -> Literal["news", "event", "unknown"]:
+    if soup and _has_event_structure(soup):
+        return "event"
+
     if soup and _has_news_structure(soup):
         return "news"
 
@@ -633,11 +670,14 @@ def _parse_to_yyyy_mm_dd(s: str | None) -> str | None:
     if not s:
         return None
     normalized_text = _normalize_date_text(s)
-    parsed = _parse_date_candidate(normalized_text)
-    if parsed:
-        return parsed
-    candidate = _extract_date_candidate(normalized_text)
-    return _parse_date_candidate(candidate)
+    for candidate in (
+        normalized_text,
+        _extract_date_candidate(normalized_text),
+    ):
+        parsed = _parse_date_candidate(candidate)
+        if parsed:
+            return parsed
+    return None
 
 
 def _is_date_after_min_date(extracted_date: str | None, min_date: str | None) -> bool:
@@ -764,21 +804,17 @@ def _discover_text_and_detection(payload: UrlTextDetectionInput) -> UrlTextDetec
             is_event_structure = _has_event_structure(soup)
 
             if is_news_structure:
-                title = _extract_news_title(soup) or "N/A"
-                text = _extract_news_text(soup) or ""
-                page_image = _extract_news_image(soup, page_url=url_str)
-                page_datetime = _extract_news_datetime(soup)
-                page_location = _extract_event_location(soup)
+                title, text, page_image, page_datetime, page_location = _extract_news_page_data(soup, url_str)
+                title = title or "N/A"
+                text = text or ""
             elif is_event_structure:
-                title = _extract_event_title(soup) or "N/A"
-                text = _extract_event_text(soup) or ""
-                page_image = None
-                page_datetime = _extract_event_date_text(soup)
-                page_location = _extract_event_card_location(soup)
+                title, text, page_image, page_datetime, page_location = _extract_event_page_data(soup, url_str)
+                title = title or "N/A"
+                text = text or ""
             else:
                 title = _extract_title(soup) or "N/A"
                 text = _extract_main_text(soup) or ""
-                page_image = None
+                page_image = _extract_page_image(soup, url_str)
                 page_datetime = _extract_event_datetime(soup)
                 page_location = _extract_event_location(soup)
 
@@ -799,6 +835,8 @@ def _discover_text_and_detection(payload: UrlTextDetectionInput) -> UrlTextDetec
                 detected_type = "news"
             elif is_event_structure:
                 detected_type = "event"
+            else:
+                detected_type = "unknown"
 
             detected_pages.append(
                 DetectedPage(
@@ -842,7 +880,6 @@ def _summarize_news_urls(payload: UrlSummarizeInput) -> NewsBatchResult:
             item = NewsItem(
                 news_title=page.detected_title or "N/A",
                 news_author=page.detected_author or "N/A",
-                news_auther=page.detected_author or "N/A",
                 news_content_summary=summary or "N/A",
                 news_url=page.source_url,
                 news_image=page.detected_image,
