@@ -6,12 +6,23 @@ from typing import List, Optional, Dict, Any
 from enum import Enum
 from pydantic import BaseModel, Field
 from bs4 import BeautifulSoup
-import requests
 from mcp.server import Server
 from mcp.types import Tool, TextContent
 from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
 import uvicorn
+
+# ============================================================================
+# CONSTANTS
+# ============================================================================
+
+FACEBOOK_MAX_LENGTH = 63206
+LINKEDIN_HEADLINE_MAX = 200
+X_MAX_LENGTH = 280
+INSTAGRAM_MAX_LENGTH = 2200
+DISCORD_DESCRIPTION_MAX = 2048
+DISCORD_TITLE_MAX = 256
+DISCORD_DEFAULT_COLOR = 3447003
 
 # ============================================================================
 # PYDANTIC SCHEMAS
@@ -458,10 +469,17 @@ async def parse_html_and_extract_news(html_content: str, source_url: str) -> Dic
             "status": "success"
         }
     
+    except (ValueError, AttributeError, KeyError) as e:
+        return {
+            "status": "error",
+            "error": f"Parsing error: {str(e)}",
+            "news_items": [],
+            "events": []
+        }
     except Exception as e:
         return {
             "status": "error",
-            "error": str(e),
+            "error": f"Unexpected error: {str(e)}",
             "news_items": [],
             "events": []
         }
@@ -491,10 +509,15 @@ async def detect_events_from_content(content: str, current_date: str = None) -> 
             "locations_found": locations_found,
             "message": "Content processed. Use with LLM for full event extraction."
         }
+    except (ValueError, re.error) as e:
+        return {
+            "status": "error",
+            "error": f"Content parsing error: {str(e)}"
+        }
     except Exception as e:
         return {
             "status": "error",
-            "error": str(e)
+            "error": f"Unexpected error: {str(e)}"
         }
 
 async def generate_social_posts(
@@ -552,7 +575,7 @@ Tudj meg többet: {source_url}
     
     if "facebook" in platforms:
         result["facebook"] = {
-            "content": templates["facebook"][:63206],
+            "content": templates["facebook"][:FACEBOOK_MAX_LENGTH],
             "hashtags": ["#BME", "#Hírek"],
             "cta_button": "Tudj meg többet" if events else None,
             "cta_url": events[0].get("registration_url") if events else None
@@ -560,7 +583,7 @@ Tudj meg többet: {source_url}
     
     if "linkedin" in platforms:
         result["linkedin"] = {
-            "headline": news_title[:200],
+            "headline": news_title[:LINKEDIN_HEADLINE_MAX],
             "body": templates["linkedin"],
             "hashtags": ["BME", "Hírek", "Oktatás"],
             "cta_text": "Regisztrálj",
@@ -569,26 +592,26 @@ Tudj meg többet: {source_url}
     
     if "x" in platforms:
         result["x"] = {
-            "content": templates["x"][:280],
+            "content": templates["x"][:X_MAX_LENGTH],
             "hashtags": ["BME", "Hírek"]
         }
     
     if "instagram" in platforms:
         result["instagram"] = {
-            "caption": templates["instagram"][:2200],
+            "caption": templates["instagram"][:INSTAGRAM_MAX_LENGTH],
             "hashtags": ["BME", "Egyetem", "Hírek", "Oktatás"],
             "emoji_usage": "🎓📚🏫"
         }
     
     if "discord" in platforms:
         result["discord"] = {
-            "embed_title": news_title[:256],
-            "embed_description": news_content[:2048],
+            "embed_title": news_title[:DISCORD_TITLE_MAX],
+            "embed_description": news_content[:DISCORD_DESCRIPTION_MAX],
             "embed_fields": {
                 "Forrás": source_url,
                 "Típus": "Hír"
             },
-            "embed_color": 3447003
+            "embed_color": DISCORD_DEFAULT_COLOR
         }
     
     return {
@@ -642,10 +665,16 @@ async def enrich_with_registration_link(
             "platform": platform
         }
     
+    except (KeyError, ValueError) as e:
+        return {
+            "status": "error",
+            "error": f"Enrichment error: {str(e)}",
+            "enriched_post": post
+        }
     except Exception as e:
         return {
             "status": "error",
-            "error": str(e),
+            "error": f"Unexpected error: {str(e)}",
             "enriched_post": post
         }
 
@@ -747,6 +776,8 @@ async def call_tool_api(request: ToolRequest):
 
 async def run_server():
     """HTTP szerver indítása"""
+    # Uvicorn nem lehet async context-ben futtatva
+    # Ezért direkt hívjuk meg, nem await-vel
     uvicorn.run(
         app,
         host="0.0.0.0",
@@ -755,5 +786,5 @@ async def run_server():
     )
 
 if __name__ == "__main__":
-    # HTTP mode - n8n JSON-RPC wrapper-rel
-    asyncio.run(run_server())
+    # Nem asyncio.run()-t használunk, mert az uvicorn már saját event loop-ot kezel
+    run_server()
