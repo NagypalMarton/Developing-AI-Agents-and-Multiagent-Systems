@@ -130,6 +130,7 @@ class UrlDiscoveryResult(BaseModel):
     discovered_urls: list[HttpUrl]
     filtered_by_date: bool = False
     applied_min_date: str | None = None
+    errors: list["ToolError"] = Field(default_factory=list)
 
 
 class UrlSummarizeInput(BaseModel):
@@ -137,6 +138,10 @@ class UrlSummarizeInput(BaseModel):
         description="A discover_text_and_detection_from_url tool kimenete.")
     max_items: int = Field(default=10, ge=1, le=100)
     summary_sentence_count: int = Field(default=3, ge=1, le=10)
+    min_date: str | None = Field(
+        default=None,
+        description="Minimum datum (YYYY.MM.DD vagy YYYY-MM-DD formatumban). A megadott dátumnál régebbi elemeket kihagyja az összefoglalásból.",
+    )
 
 
 class UrlTextDetectionInput(BaseModel):
@@ -155,7 +160,7 @@ class DetectedPage(BaseModel):
     detected_author: str | None = None
     detected_text: str
     detected_image: HttpUrl | None = None
-    detected_datetime: str
+    detected_datetime: str | None = None
     detected_european_date: str | None = None
     detected_location: str | None = None
     detected_guests_list: list[str] = Field(default_factory=list)
@@ -165,7 +170,7 @@ class DetectedPage(BaseModel):
 class UrlTextDetectionResult(BaseModel):
     processed_count: int
     detected_pages: list[DetectedPage]
-    errors: list[str]
+    errors: list["ToolError"] = Field(default_factory=list)
 
 
 
@@ -182,7 +187,7 @@ class NewsItem(BaseModel):
 class NewsBatchResult(BaseModel):
     processed_count: int
     news_items: list[NewsItem]
-    errors: list[str]
+    errors: list["ToolError"] = Field(default_factory=list)
 
 
 class EventItem(BaseModel):
@@ -197,7 +202,14 @@ class EventItem(BaseModel):
 class EventBatchResult(BaseModel):
     processed_count: int
     events_items: list[EventItem]
-    errors: list[str]
+    errors: list["ToolError"] = Field(default_factory=list)
+
+
+class ToolError(BaseModel):
+    stage: str
+    error_type: str
+    message: str
+    url: str | None = None
 
 
 def _fetch_html(url: str, timeout: int = 15) -> str:
@@ -214,6 +226,26 @@ def _fetch_html(url: str, timeout: int = 15) -> str:
     )
     response.raise_for_status()
     return response.text
+
+
+def _make_tool_error(stage: str, exc: Exception, url: str | None = None) -> ToolError:
+    return ToolError(
+        stage=stage,
+        error_type=exc.__class__.__name__,
+        message=str(exc),
+        url=url,
+    )
+
+
+def _coerce_attribute_text(value: object | None) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return None
+        value = value[0]
+    text = str(value).strip()
+    return text or None
 
 
 def _parse_html(html: str) -> BeautifulSoup:
@@ -264,8 +296,9 @@ def _extract_first_selector_url(soup: BeautifulSoup, selectors: list[str], page_
             continue
 
         source = element.get("src") or element.get("href")
-        if source:
-            candidate = urljoin(page_url, source.strip())
+        source_text = _coerce_attribute_text(source)
+        if source_text:
+            candidate = urljoin(page_url, source_text)
             parsed = urlparse(candidate)
             if parsed.scheme and parsed.scheme.lower() in {"http", "https"}:
                 return cast(HttpUrl, candidate)
@@ -415,8 +448,9 @@ def _extract_main_text(soup: BeautifulSoup) -> str | None:
 
 def _extract_title(soup: BeautifulSoup) -> str | None:
     og_title = soup.find("meta", attrs={"property": "og:title"})
-    if og_title and og_title.get("content"):
-        return og_title["content"].strip()
+    og_title_content = _coerce_attribute_text(og_title.get("content")) if og_title else None
+    if og_title_content:
+        return og_title_content
 
     h1 = soup.find("h1")
     if h1 and h1.get_text(strip=True):
@@ -430,12 +464,16 @@ def _extract_title(soup: BeautifulSoup) -> str | None:
 
 def _extract_author(soup: BeautifulSoup) -> str | None:
     author_meta = soup.find("meta", attrs={"name": "author"})
-    if author_meta and author_meta.get("content"):
-        return author_meta["content"].strip()
+    author_meta_content = _coerce_attribute_text(author_meta.get("content")) if author_meta else None
+    if author_meta_content:
+        return author_meta_content
 
     article_author_meta = soup.find("meta", attrs={"property": "article:author"})
-    if article_author_meta and article_author_meta.get("content"):
-        return article_author_meta["content"].strip()
+    article_author_content = (
+        _coerce_attribute_text(article_author_meta.get("content")) if article_author_meta else None
+    )
+    if article_author_content:
+        return article_author_content
 
     author_pattern = re.compile(r"author|byline|szerzo", re.I)
     for tag in soup.find_all(True):
@@ -517,12 +555,13 @@ def _extract_event_registration(soup: BeautifulSoup, page_url: str) -> HttpUrl |
     registration_pattern = re.compile(r"register|registration|signup|ticket|book|jelentkez", re.I)
     for a_tag in soup.find_all("a"):
         href = a_tag.get("href")
-        if not href:
+        href_text = _coerce_attribute_text(href)
+        if not href_text:
             continue
         anchor_text = a_tag.get_text(" ", strip=True)
-        haystack = f"{href} {anchor_text}"
+        haystack = f"{href_text} {anchor_text}"
         if registration_pattern.search(haystack):
-            candidate = urljoin(page_url, href.strip())
+            candidate = urljoin(page_url, href_text)
             parsed = urlparse(candidate)
             if parsed.scheme and parsed.scheme.lower() in {"http", "https"}:
                 return cast(HttpUrl, candidate)
@@ -530,34 +569,30 @@ def _extract_event_registration(soup: BeautifulSoup, page_url: str) -> HttpUrl |
     return None
 
 
-def _parse_to_yyyy_mm_dd(s: str | None) -> str | None:
-    if not s:
-        return None
-    s = s.strip()
-
-    normalized_text = s.lower()
+def _normalize_date_text(text: str) -> str:
+    normalized_text = text.strip().lower()
     for month_name, month_number in HUNGARIAN_MONTHS.items():
         normalized_text = normalized_text.replace(month_name, month_number)
     for month_name, month_number in ENGLISH_MONTHS.items():
         normalized_text = normalized_text.replace(month_name, month_number)
-    normalized_text = re.sub(r"\s+", " ", normalized_text)
+    return re.sub(r"\s+", " ", normalized_text)
 
-    # First handle event-like date strings with loose separators, e.g.
-    # "2026. 05. 15. - 20:00" or "2026. 05 15.".
-    loose_match = re.search(r"(\d{4})\D+(\d{1,2})\D+(\d{1,2})", normalized_text)
+
+def _extract_date_candidate(text: str) -> str:
+    matched = DATE_TIME_RE.search(text)
+    candidate = matched.group(1) if matched else text
+    return re.sub(r"\s+", "", candidate).rstrip(".-/")
+
+
+def _parse_date_candidate(candidate: str) -> str | None:
+    loose_match = re.search(r"(\d{4})\D+(\d{1,2})\D+(\d{1,2})", candidate)
     if loose_match:
         year, month, day = loose_match.groups()
-        candidate = f"{year}.{int(month):02d}.{int(day):02d}"
         try:
-            dt = datetime.strptime(candidate, "%Y.%m.%d")
+            dt = datetime.strptime(f"{year}.{int(month):02d}.{int(day):02d}", "%Y.%m.%d")
             return dt.strftime("%Y.%m.%d")
         except ValueError:
             pass
-    
-    # Extract a date-like substring and ignore optional time fragments.
-    m = DATE_TIME_RE.search(normalized_text)
-    substr = m.group(1) if m else normalized_text
-    substr = re.sub(r"\s+", "", substr).rstrip(".-/")
 
     fmts = [
         "%Y-%m-%d",
@@ -577,13 +612,12 @@ def _parse_to_yyyy_mm_dd(s: str | None) -> str | None:
     ]
     for fmt in fmts:
         try:
-            dt = datetime.strptime(substr, fmt)
+            dt = datetime.strptime(candidate, fmt)
             return dt.strftime("%Y.%m.%d")
         except ValueError:
             continue
 
-    # Try again after coercing YYYYMMDD-like strings into dotted form.
-    compact_match = re.fullmatch(r"(\d{4})(\d{2})(\d{1,2})", substr)
+    compact_match = re.fullmatch(r"(\d{4})(\d{2})(\d{1,2})", candidate)
     if compact_match:
         year, month, day = compact_match.groups()
         try:
@@ -593,6 +627,17 @@ def _parse_to_yyyy_mm_dd(s: str | None) -> str | None:
             pass
 
     return None
+
+
+def _parse_to_yyyy_mm_dd(s: str | None) -> str | None:
+    if not s:
+        return None
+    normalized_text = _normalize_date_text(s)
+    parsed = _parse_date_candidate(normalized_text)
+    if parsed:
+        return parsed
+    candidate = _extract_date_candidate(normalized_text)
+    return _parse_date_candidate(candidate)
 
 
 def _is_date_after_min_date(extracted_date: str | None, min_date: str | None) -> bool:
@@ -620,6 +665,16 @@ def _is_date_after_min_date(extracted_date: str | None, min_date: str | None) ->
     return extracted_normalized >= min_normalized
 
 
+def _is_any_date_after_min_date(candidate_dates: list[str | None], min_date: str | None) -> bool:
+    if not min_date:
+        return True
+    return any(
+        _is_date_after_min_date(candidate_date, min_date)
+        for candidate_date in candidate_dates
+        if candidate_date
+    )
+
+
 def _make_summary(text: str | None, max_sentences: int) -> str | None:
     if not text:
         return None
@@ -638,10 +693,27 @@ def _make_summary(text: str | None, max_sentences: int) -> str | None:
 def _discover_urls(payload: UrlDiscoveryInput) -> UrlDiscoveryResult:
     html = payload.html_content
     if payload.page_url:
-        html = _fetch_html(str(payload.page_url))
+        try:
+            html = _fetch_html(str(payload.page_url))
+        except requests.RequestException as exc:
+            return UrlDiscoveryResult(
+                source_url=payload.page_url,
+                total_links_scanned=0,
+                discovered_urls=[],
+                filtered_by_date=bool(payload.min_date),
+                applied_min_date=payload.min_date,
+                errors=[_make_tool_error("discover_news_event_urls", exc, url=str(payload.page_url))],
+            )
 
     if not html:
-        raise ValueError("Nem talalhato HTML tartalom a feldolgozashoz.")
+        return UrlDiscoveryResult(
+            source_url=payload.page_url,
+            total_links_scanned=0,
+            discovered_urls=[],
+            filtered_by_date=bool(payload.min_date),
+            applied_min_date=payload.min_date,
+            errors=[_make_tool_error("discover_news_event_urls", ValueError("Nem talalhato HTML tartalom a feldolgozashoz."))],
+        )
 
     base = str(payload.base_url or payload.page_url) if (payload.base_url or payload.page_url) else None
     soup = _parse_html(html)
@@ -652,29 +724,20 @@ def _discover_urls(payload: UrlDiscoveryInput) -> UrlDiscoveryResult:
     for a_tag in soup.find_all("a"):
         scanned_links += 1
         href = a_tag.get("href")
-        absolute_url = _normalize_url(href, base)
+        absolute_url = _normalize_url(_coerce_attribute_text(href), base)
         if not absolute_url:
             continue
 
-        # If min_date is provided, keep only links whose embedded date is parseable
-        # and not older than min_date.
         if payload.min_date:
-            url_str = str(absolute_url)
-            context_date = _extract_date_from_link_context(a_tag)
-
-            is_url_recent = _is_date_after_min_date(url_str, payload.min_date)
-            is_context_recent = (
-                _is_date_after_min_date(context_date, payload.min_date)
-                if context_date
-                else False
-            )
-
-            if not (is_url_recent or is_context_recent):
+            if not _is_any_date_after_min_date(
+                [str(absolute_url), _extract_date_from_link_context(a_tag)],
+                payload.min_date,
+            ):
                 continue
 
         discovered_urls.append(absolute_url)
 
-    unique_urls = sorted(set(discovered_urls))
+    unique_urls = list(dict.fromkeys(discovered_urls))
 
     return UrlDiscoveryResult(
         source_url=payload.page_url,
@@ -689,7 +752,7 @@ def _discover_text_and_detection(payload: UrlTextDetectionInput) -> UrlTextDetec
     selected = payload.urls[: payload.max_items]
 
     detected_pages: list[DetectedPage] = []
-    errors: list[str] = []
+    errors: list[ToolError] = []
 
     for url in selected:
         url_str = str(url)
@@ -726,12 +789,8 @@ def _discover_text_and_detection(payload: UrlTextDetectionInput) -> UrlTextDetec
             event_guests = _extract_event_guests(soup)
             registration = _extract_event_registration(soup, page_url=url_str)
 
-            # Ha van min_date szűrés, ellenőrizzük a dátumot
             if payload.min_date:
-                # Próbálunk dátumot nyerni az event_datetime-ból vagy az URL-ből
-                date_to_check = event_datetime or url_str
-                if not _is_date_after_min_date(date_to_check, payload.min_date):
-                    # Ez az oldal régebbi a min_date-nél, kihagyjuk
+                if not _is_any_date_after_min_date([event_datetime, url_str], payload.min_date):
                     continue
 
             detected_type = _classify_page_content(soup=soup)
@@ -757,7 +816,7 @@ def _discover_text_and_detection(payload: UrlTextDetectionInput) -> UrlTextDetec
                 )
             )
         except (requests.RequestException, ValueError, TypeError, ValidationError) as exc:
-            errors.append(f"{url} -> {exc}")
+            errors.append(_make_tool_error("discover_text_and_detection_from_url", exc, url=url_str))
 
     return UrlTextDetectionResult(
         processed_count=len(detected_pages),
@@ -767,10 +826,15 @@ def _discover_text_and_detection(payload: UrlTextDetectionInput) -> UrlTextDetec
 
 
 def _summarize_news_urls(payload: UrlSummarizeInput) -> NewsBatchResult:
-    selected = [page for page in payload.detected_pages if page.detected_type == "news"][: payload.max_items]
+    selected = [
+        page
+        for page in payload.detected_pages
+        if page.detected_type == "news"
+        and _is_any_date_after_min_date([page.detected_european_date, page.detected_datetime], payload.min_date)
+    ][: payload.max_items]
 
     news_items: list[NewsItem] = []
-    errors: list[str] = []
+    errors: list[ToolError] = []
 
     for page in selected:
         try:
@@ -785,7 +849,7 @@ def _summarize_news_urls(payload: UrlSummarizeInput) -> NewsBatchResult:
             )
             news_items.append(item)
         except (ValueError, TypeError, ValidationError) as exc:
-            errors.append(f"{page.source_url} -> {exc}")
+            errors.append(_make_tool_error("summarize_news_urls", exc, url=str(page.source_url)))
 
     return NewsBatchResult(
         processed_count=len(news_items),
@@ -795,10 +859,15 @@ def _summarize_news_urls(payload: UrlSummarizeInput) -> NewsBatchResult:
 
 
 def _summarize_event_urls(payload: UrlSummarizeInput) -> EventBatchResult:
-    selected = [page for page in payload.detected_pages if page.detected_type == "event"][: payload.max_items]
+    selected = [
+        page
+        for page in payload.detected_pages
+        if page.detected_type == "event"
+        and _is_any_date_after_min_date([page.detected_european_date, page.detected_datetime], payload.min_date)
+    ][: payload.max_items]
 
     events_items: list[EventItem] = []
-    errors: list[str] = []
+    errors: list[ToolError] = []
 
     for page in selected:
         try:
@@ -813,7 +882,7 @@ def _summarize_event_urls(payload: UrlSummarizeInput) -> EventBatchResult:
             )
             events_items.append(item)
         except (ValueError, TypeError, ValidationError) as exc:
-            errors.append(f"{page.source_url} -> {exc}")
+            errors.append(_make_tool_error("summarize_event_urls", exc, url=str(page.source_url)))
 
     return EventBatchResult(
         processed_count=len(events_items),
