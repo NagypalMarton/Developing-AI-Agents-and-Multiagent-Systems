@@ -7,8 +7,9 @@ from enum import Enum
 from pydantic import BaseModel, Field
 from bs4 import BeautifulSoup
 import requests
-from mcp.server import Server
-from mcp.server.stdio import stdio_server
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
+import uvicorn
 
 # ============================================================================
 # PYDANTIC SCHEMAS
@@ -84,6 +85,17 @@ class NewsAnalysisResponse(BaseModel):
     news_items: List[NewsItem]
     total_events_detected: int
     total_posts_generated: int
+
+class ToolCallRequest(BaseModel):
+    """MCP Tool hívás request"""
+    name: str = Field(..., description="Tool neve")
+    arguments: Dict[str, Any] = Field(..., description="Tool paraméterei")
+
+class ToolCallResponse(BaseModel):
+    """MCP Tool response"""
+    status: str = Field(default="success")
+    result: Optional[Dict[str, Any]] = None
+    error: Optional[str] = None
 
 # ============================================================================
 # HTML PARSER UTILS
@@ -269,100 +281,8 @@ def detect_event_type(title: str) -> EventType:
     return EventType.OTHER
 
 # ============================================================================
-# MCP SERVER SETUP
+# MCP SERVER SETUP (HTTP API-ra átalakítva)
 # ============================================================================
-
-server = Server("news-to-social-agent")
-
-@server.list_tools()
-async def list_tools():
-    """List available tools"""
-    return [
-        {
-            "name": "parse_html_and_extract_news",
-            "description": "HTML feldolgozás és hírek + események extraktálása",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "html_content": {"type": "string", "description": "HTML tartalom"},
-                    "source_url": {"type": "string", "description": "Forrás URL"}
-                },
-                "required": ["html_content", "source_url"]
-            }
-        },
-        {
-            "name": "detect_events_from_content",
-            "description": "Eseményadatok detektálása szövegből",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "content": {"type": "string", "description": "Szöveg tartalom"},
-                    "current_date": {"type": "string", "description": "Aktuális dátum (ISO format)"}
-                },
-                "required": ["content"]
-            }
-        },
-        {
-            "name": "generate_social_posts",
-            "description": "Platform-specifikus szociálmédiai posztok generálása",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "news_title": {"type": "string"},
-                    "news_content": {"type": "string"},
-                    "source_url": {"type": "string"},
-                    "events": {"type": "array"},
-                    "platforms": {"type": "array", "items": {"type": "string"}}
-                },
-                "required": ["news_title", "news_content", "source_url"]
-            }
-        },
-        {
-            "name": "enrich_with_registration_link",
-            "description": "Regisztrációs link injektálása posztokba",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "post": {"type": "object"},
-                    "event": {"type": "object"},
-                    "platform": {"type": "string"}
-                },
-                "required": ["post", "event", "platform"]
-            }
-        }
-    ]
-
-@server.call_tool()
-async def call_tool(name: str, arguments: dict) -> str:
-    """Handle tool calls"""
-    if name == "parse_html_and_extract_news":
-        result = await parse_html_and_extract_news(
-            arguments["html_content"],
-            arguments["source_url"]
-        )
-    elif name == "detect_events_from_content":
-        result = await detect_events_from_content(
-            arguments["content"],
-            arguments.get("current_date")
-        )
-    elif name == "generate_social_posts":
-        result = await generate_social_posts(
-            arguments["news_title"],
-            arguments["news_content"],
-            arguments["source_url"],
-            arguments.get("events"),
-            arguments.get("platforms")
-        )
-    elif name == "enrich_with_registration_link":
-        result = await enrich_with_registration_link(
-            arguments["post"],
-            arguments["event"],
-            arguments["platform"]
-        )
-    else:
-        raise ValueError(f"Unknown tool: {name}")
-    
-    return json.dumps(result, ensure_ascii=False, indent=2)
 
 async def parse_html_and_extract_news(html_content: str, source_url: str) -> Dict[str, Any]:
     """
@@ -626,10 +546,121 @@ async def enrich_with_registration_link(
 # SERVER RUN
 # ============================================================================
 
-if __name__ == "__main__":
-    import sys
-    async def main():
-        async with stdio_server(server) as (read_stream, write_stream):
-            await read_stream.aread()
+# FastAPI app HTTP endpoint-okkal
+app = FastAPI(
+    title="News to Social Media MCP Server",
+    description="MCP szerver egyetemi hírek feldolgozásához és szociálmédiai posztok generálásához",
+    version="1.0.0"
+)
+
+@app.get("/")
+async def root():
+    """Root endpoint - szerver státusza"""
+    return {
+        "status": "running",
+        "service": "News to Social Media MCP Server",
+        "version": "1.0.0",
+        "endpoint": "/mcp/tool"
+    }
+
+@app.get("/health")
+async def health():
+    """Health check endpoint"""
+    return {"status": "healthy"}
+
+@app.post("/mcp/tool", response_model=ToolCallResponse)
+async def call_mcp_tool(request: ToolCallRequest):
+    """
+    MCP Tool hívás HTTP JSON-RPC protokollon
     
-    asyncio.run(main())
+    Exemplo:
+    ```json
+    {
+        "name": "parse_html_and_extract_news",
+        "arguments": {
+            "html_content": "<div>...</div>",
+            "source_url": "https://example.com"
+        }
+    }
+    ```
+    """
+    try:
+        tool_name = request.name
+        args = request.arguments
+        
+        if tool_name == "parse_html_and_extract_news":
+            result = await parse_html_and_extract_news(
+                args.get("html_content", ""),
+                args.get("source_url", "")
+            )
+        elif tool_name == "detect_events_from_content":
+            result = await detect_events_from_content(
+                args.get("content", ""),
+                args.get("current_date")
+            )
+        elif tool_name == "generate_social_posts":
+            result = await generate_social_posts(
+                args.get("news_title", ""),
+                args.get("news_content", ""),
+                args.get("source_url", ""),
+                args.get("events"),
+                args.get("platforms")
+            )
+        elif tool_name == "enrich_with_registration_link":
+            result = await enrich_with_registration_link(
+                args.get("post", {}),
+                args.get("event", {}),
+                args.get("platform", "")
+            )
+        else:
+            return ToolCallResponse(
+                status="error",
+                error=f"Unknown tool: {tool_name}"
+            )
+        
+        return ToolCallResponse(
+            status="success",
+            result=result
+        )
+    
+    except Exception as e:
+        return ToolCallResponse(
+            status="error",
+            error=str(e)
+        )
+
+@app.get("/mcp/tools")
+async def list_available_tools():
+    """Elérhető toolok listázása"""
+    return {
+        "tools": [
+            {
+                "name": "parse_html_and_extract_news",
+                "description": "HTML feldolgozás és hírek + események extraktálása",
+                "parameters": ["html_content", "source_url"]
+            },
+            {
+                "name": "detect_events_from_content",
+                "description": "Eseményadatok detektálása szövegből",
+                "parameters": ["content", "current_date"]
+            },
+            {
+                "name": "generate_social_posts",
+                "description": "Platform-specifikus szociálmédiai posztok generálása",
+                "parameters": ["news_title", "news_content", "source_url", "events", "platforms"]
+            },
+            {
+                "name": "enrich_with_registration_link",
+                "description": "Regisztrációs link injektálása posztokba",
+                "parameters": ["post", "event", "platform"]
+            }
+        ]
+    }
+
+if __name__ == "__main__":
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=8000,
+        log_level="info"
+    )
