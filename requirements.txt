@@ -1,5 +1,5 @@
 mcp==1.0.0
-pydantic==2.6.3
+pydantic>=2.8.0
 beautifulsoup4==4.12.2
 requests==2.31.0
 python-dateutil==2.8.2
