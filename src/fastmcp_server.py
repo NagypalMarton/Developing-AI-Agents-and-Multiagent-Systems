@@ -819,7 +819,9 @@ def _discover_text_and_detection(payload: UrlTextDetectionInput) -> UrlTextDetec
             event_guests = _extract_event_guests(soup)
             registration = _extract_event_registration(soup, page_url=url_str)
 
-            if payload.min_date:
+            # Only apply date filter if detected_type would be "unknown"
+            # For news/event, we skip the date filter since we don't reliably extract dates
+            if payload.min_date and not (is_news_structure or is_event_structure):
                 if not _is_any_date_after_min_date([event_datetime, url_str], payload.min_date):
                     continue
 
