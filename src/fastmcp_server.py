@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 from typing import Literal, cast
 from urllib.parse import urljoin, urlparse
@@ -67,33 +68,30 @@ SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 DATE_TIME_RE = re.compile(
     r"(\d{4}[./-]\s*\d{1,2}[./-]\s*\d{1,2}(?:\s+\d{1,2}:\d{2})?|\d{1,2}[./-]\s*\d{1,2}[./-]\s*\d{2,4}(?:\s+\d{1,2}:\d{2})?)"
 )
-HUNGARIAN_MONTHS = {
-    "január": "01",
-    "február": "02",
-    "március": "03",
-    "április": "04",
-    "május": "05",
-    "június": "06",
-    "július": "07",
-    "augusztus": "08",
-    "szeptember": "09",
-    "október": "10",
-    "november": "11",
-    "december": "12",
-}
-
 ENGLISH_MONTHS = {
+    "jan": "01",
     "january": "01",
+    "feb": "02",
     "february": "02",
+    "mar": "03",
     "march": "03",
+    "apr": "04",
     "april": "04",
     "may": "05",
+    "jun": "06",
     "june": "06",
+    "jul": "07",
     "july": "07",
+    "aug": "08",
     "august": "08",
+    "sep": "09",
+    "sept": "09",
     "september": "09",
+    "oct": "10",
     "october": "10",
+    "nov": "11",
     "november": "11",
+    "dec": "12",
     "december": "12",
 }
 
@@ -164,8 +162,6 @@ class DetectedPage(BaseModel):
     detected_location: str | None = None
     detected_guests_list: list[str] = Field(default_factory=list)
     detected_registration: HttpUrl | None = None
-    detected_confidence: float | None = None
-    detected_reason: str | None = None
 
 
 class UrlTextDetectionResult(BaseModel):
@@ -438,7 +434,7 @@ def _extract_news_page_data(soup: BeautifulSoup, page_url: str) -> tuple[str | N
     )
 
 
-def _extract_event_page_data(soup: BeautifulSoup, page_url: str) -> tuple[str | None, str | None, HttpUrl | None, str | None, str | None]:
+def _extract_event_page_data(soup: BeautifulSoup) -> tuple[str | None, str | None, HttpUrl | None, str | None, str | None]:
     return (
         _extract_event_title(soup),
         _extract_event_text(soup),
@@ -606,19 +602,17 @@ def _extract_event_registration(soup: BeautifulSoup, page_url: str) -> HttpUrl |
     return None
 
 
-def _normalize_date_text(text: str) -> str:
-    normalized_text = text.strip().lower()
-    for month_name, month_number in HUNGARIAN_MONTHS.items():
-        normalized_text = normalized_text.replace(month_name, month_number)
-    for month_name, month_number in ENGLISH_MONTHS.items():
-        normalized_text = normalized_text.replace(month_name, month_number)
-    return re.sub(r"\s+", " ", normalized_text)
-
-
 def _extract_date_candidate(text: str) -> str:
     matched = DATE_TIME_RE.search(text)
     candidate = matched.group(1) if matched else text
     return re.sub(r"\s+", "", candidate).rstrip(".-/")
+
+
+def _normalize_date_text(text: str) -> str:
+    normalized_text = text.strip().lower()
+    for month_name, month_number in sorted(ENGLISH_MONTHS.items(), key=lambda item: len(item[0]), reverse=True):
+        normalized_text = re.sub(rf"\b{re.escape(month_name)}\b", month_number, normalized_text)
+    return re.sub(r"\s+", " ", normalized_text)
 
 
 def _parse_date_candidate(candidate: str) -> str | None:
@@ -808,7 +802,7 @@ def _discover_text_and_detection(payload: UrlTextDetectionInput) -> UrlTextDetec
                 title = title or "N/A"
                 text = text or ""
             elif is_event_structure:
-                title, text, page_image, page_datetime, page_location = _extract_event_page_data(soup, url_str)
+                title, text, page_image, page_datetime, page_location = _extract_event_page_data(soup)
                 title = title or "N/A"
                 text = text or ""
             else:
