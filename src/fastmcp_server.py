@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import List, Optional, Dict, Any
 from enum import Enum
 from urllib.parse import quote, urlparse
+from contextlib import asynccontextmanager
 from pydantic import BaseModel, Field, field_validator, HttpUrl
 from bs4 import BeautifulSoup
 from mcp.server import Server
@@ -984,15 +985,42 @@ async def enrich_with_registration_link(
         }
 
 # ============================================================================
-# SERVER RUN
+# SERVER RUN - Lifespan Event Handler (FastAPI 0.93+)
 # ============================================================================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """FastAPI lifespan event handler for startup and shutdown"""
+    # Startup
+    logger.info("=" * 60)
+    logger.info("News to Social Media MCP Server starting up")
+    logger.info(f"HTML Parser: {HTML_PARSER_CONFIG}")
+    logger.info("=" * 60)
+    
+    yield
+    
+    # Shutdown
+    logger.info("=" * 60)
+    logger.info("News to Social Media MCP Server shutting down")
+    logger.info("=" * 60)
 
 # FastAPI app HTTP JSON-RPC wrapper MCP szerverhez
 app = FastAPI(
     title="News to Social Media MCP Server",
     description="MCP szerver HTTP JSON-RPC wrapper-rel - n8n kompatibilis",
-    version="1.0.0"
+    version="1.0.0",
+    lifespan=lifespan
 )
+
+@app.get("/health")
+async def health():
+    """Health check - no auth required"""
+    logger.debug("Health check requested")
+    return {
+        "status": "healthy",
+        "service": "News to Social Media MCP Server",
+        "version": "1.0.0"
+    }
 
 class ToolRequest(BaseModel):
     """Tool hívás request"""
@@ -1017,26 +1045,6 @@ async def root():
         "auth_required": False,
         "api_docs": "http://fastmcp-server:8000/docs"
     }
-
-@app.on_event("startup")
-async def startup_event():
-    """Log startup information"""
-    logger.info("=" * 60)
-    logger.info("News to Social Media MCP Server starting up")
-    logger.info(f"HTML Parser: {HTML_PARSER_CONFIG}")
-    logger.info("=" * 60)
-
-@app.get("/health")
-async def health():
-    """Health check - no auth required"""
-    logger.debug("Health check requested")
-    return {
-        "status": "healthy",
-        "service": "News to Social Media MCP Server",
-        "version": "1.0.0"
-    }
-
-@app.get("/mcp/tools")
 async def list_tools_api():
     """Elérhető MCP toolok listája"""
     logger.info("Tool list requested")
