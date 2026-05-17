@@ -523,6 +523,8 @@ def detect_event_type(title: str) -> EventType:
 
 mcp = FastMCP("news-to-social-agent")
 
+mcp_app = mcp.sse_app()
+
 @mcp.tool()
 async def parse_html_and_extract_news(html_content: str, source_url: str) -> Dict[str, Any]:
     """
@@ -961,7 +963,7 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-app.mount("/mcp", mcp.sse_app())
+app.mount("/mcp", mcp_app)
 
 @app.get("/health")
 async def health():
