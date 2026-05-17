@@ -523,7 +523,7 @@ def detect_event_type(title: str) -> EventType:
 
 mcp = FastMCP("news-to-social-agent")
 
-mcp_app = mcp.sse_app()
+mcp_app = mcp.streamable_http_app(streamable_http_path="/sse", json_response=True, stateless_http=True)
 
 @mcp.tool()
 async def parse_html_and_extract_news(html_content: str, source_url: str) -> Dict[str, Any]:
@@ -957,7 +957,7 @@ async def lifespan(app: FastAPI):
 # FastAPI app MCP SSE transporttal
 app = FastAPI(
     title="News to Social Media MCP Server",
-    description="MCP szerver FastAPI-val és hivatalos MCP SSE transporttal",
+    description="MCP szerver FastAPI-val és hivatalos MCP Streamable HTTP transporttal",
     version="1.0.0",
     lifespan=lifespan
 )
@@ -983,8 +983,7 @@ async def root():
         "service": "News to Social Media MCP Server",
         "version": "1.0.0",
         "endpoints": {
-            "mcp_sse": "http://fastmcp-server:8000/mcp/sse",
-            "mcp_messages": "http://fastmcp-server:8000/mcp/messages/",
+            "mcp_streamable_http": "http://fastmcp-server:8000/mcp/sse",
             "health": "http://fastmcp-server:8000/health"
         },
         "auth_required": False,
