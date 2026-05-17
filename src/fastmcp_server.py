@@ -80,7 +80,6 @@ class ParserType(str, Enum):
     BME_NEWS = "bme_news"
     BME_EVENT = "bme_event"
     SIMPLE_EVENT = "simple_event"
-
 # ============================================================================
 # PYDANTIC SCHEMAS
 # ============================================================================
