@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager
 from pydantic import BaseModel, Field, field_validator, HttpUrl
 from bs4 import BeautifulSoup
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 from fastapi import FastAPI
 import uvicorn
 
@@ -523,6 +524,21 @@ def detect_event_type(title: str) -> EventType:
 
 mcp = FastMCP("news-to-social-agent")
 mcp.settings.streamable_http_path = "/sse"
+mcp.settings.transport_security = TransportSecuritySettings(
+    enable_dns_rebinding_protection=True,
+    allowed_hosts=[
+        "127.0.0.1:*",
+        "localhost:*",
+        "[::1]:*",
+        "fastmcp-server:*",
+    ],
+    allowed_origins=[
+        "http://127.0.0.1:*",
+        "http://localhost:*",
+        "http://[::1]:*",
+        "http://fastmcp-server:*",
+    ],
+)
 
 mcp_app = mcp.streamable_http_app()
 
