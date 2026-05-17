@@ -5,12 +5,12 @@ import logging
 from datetime import datetime
 from typing import List, Optional, Dict, Any
 from enum import Enum
-from urllib.parse import quote, urlparse
+from urllib.parse import urlparse
 from contextlib import asynccontextmanager
 from pydantic import BaseModel, Field, field_validator, HttpUrl
 from bs4 import BeautifulSoup
 from mcp.server import Server
-from mcp.types import Tool, TextContent
+from mcp.types import Tool
 from fastapi import FastAPI, Body, HTTPException, status
 import uvicorn
 
@@ -73,13 +73,6 @@ HTML_SELECTORS = {
     }
 }
 
-# Supported HTML parser types
-class ParserType(str, Enum):
-    TMIT = "tmit"
-    VIK = "vik"
-    BME_NEWS = "bme_news"
-    BME_EVENT = "bme_event"
-    SIMPLE_EVENT = "simple_event"
 # ============================================================================
 # PYDANTIC SCHEMAS
 # ============================================================================
@@ -156,7 +149,7 @@ def _extract_tmit_news(soup, source_url: str) -> List[Dict[str, Any]]:
             if news:
                 news_items.append(news.model_dump())
         logger.info(f"Found {len(tmit_articles)} TMIT articles")
-    except Exception as e:
+    except (AttributeError, TypeError, ValueError) as e:
         logger.error(f"Error parsing TMIT articles: {e}")
     return news_items
 
@@ -174,7 +167,7 @@ def _extract_vik_news(soup, source_url: str) -> List[Dict[str, Any]]:
                 if news:
                     news_items.append(news.model_dump())
         logger.info(f"Found {len(vik_news)} VIK news items")
-    except Exception as e:
+    except (AttributeError, TypeError, ValueError) as e:
         logger.error(f"Error parsing VIK news: {e}")
     return news_items
 
@@ -190,7 +183,7 @@ def _extract_bme_news(soup, source_url: str) -> List[Dict[str, Any]]:
             if news:
                 news_items.append(news.model_dump())
         logger.info(f"Found {len(bme_news)} BME news cards")
-    except Exception as e:
+    except (AttributeError, TypeError, ValueError) as e:
         logger.error(f"Error parsing BME news: {e}")
     return news_items
 
@@ -208,7 +201,7 @@ def _extract_bme_events(soup, source_url: str) -> List[Dict[str, Any]]:
                 if event:
                     events.append(event.model_dump())
         logger.info(f"Found {len(bme_events)} BME events")
-    except Exception as e:
+    except (AttributeError, TypeError, ValueError) as e:
         logger.error(f"Error parsing BME events: {e}")
     return events
 
@@ -224,7 +217,7 @@ def _extract_simple_events(soup, source_url: str) -> List[Dict[str, Any]]:
             if event:
                 events.append(event.model_dump())
         logger.info(f"Found {len(simple_events)} simple events")
-    except Exception as e:
+    except (AttributeError, TypeError, ValueError) as e:
         logger.error(f"Error parsing simple events: {e}")
     return events
 
@@ -266,7 +259,7 @@ def validate_url_safety(url: Optional[str]) -> Optional[str]:
             logger.warning(f"Invalid URL scheme: {parsed.scheme}")
             return None
         return url
-    except Exception as e:
+    except (ValueError, TypeError, AttributeError) as e:
         logger.warning(f"URL validation failed: {e}")
         return None
 
@@ -301,7 +294,7 @@ def parse_tmit_news(html_content: str, source_url: str) -> Optional[NewsItem]:
             image_url=image_url,
             source_url=str(source_url)
         )
-    except Exception as e:
+    except (AttributeError, TypeError, ValueError) as e:
         logger.error(f"Error parsing TMIT news: {e}")
         return None
 
@@ -329,7 +322,7 @@ def parse_vik_news(html_content: str, source_url: str) -> Optional[NewsItem]:
             source_url=str(source_url),
             publish_date=publish_date
         )
-    except Exception as e:
+    except (AttributeError, TypeError, ValueError) as e:
         logger.error(f"Error parsing VIK news: {e}")
         return None
 
@@ -357,7 +350,7 @@ def parse_bme_news(html_content: str, source_url: str) -> Optional[NewsItem]:
             source_url=str(source_url),
             publish_date=publish_date
         )
-    except Exception as e:
+    except (AttributeError, TypeError, ValueError) as e:
         logger.error(f"Error parsing BME news: {e}")
         return None
 
@@ -383,7 +376,7 @@ def parse_bme_event(html_content: str, source_url: str) -> Optional[EventDetecte
             description=description,
             source_url=str(source_url)
         )
-    except Exception as e:
+    except (AttributeError, TypeError, ValueError) as e:
         logger.error(f"Error parsing BME event: {e}")
         return None
 
@@ -403,7 +396,7 @@ def parse_simple_event(html_content: str, source_url: str) -> Optional[EventDete
             description="",
             source_url=str(source_url)
         )
-    except Exception as e:
+    except (AttributeError, TypeError, ValueError) as e:
         logger.error(f"Error parsing simple event: {e}")
         return None
 
@@ -438,39 +431,31 @@ def parse_date_string(date_str: str) -> str:
         datetime.fromisoformat(result)
         return result
         
-    except (ValueError, AttributeError) as e:
+    except (ValueError, TypeError, AttributeError) as e:
         logger.warning(f"Date parsing validation failed for '{date_str}': {e}")
-        return datetime.now().isoformat()
-    except Exception as e:
-        logger.error(f"Unexpected error parsing date '{date_str}': {e}")
         return datetime.now().isoformat()
 
 def detect_event_type(title: str) -> EventType:
     """Eseménytípus detektálása a címből - TYPE SAFE"""
     if not title or not isinstance(title, str):
         return EventType.OTHER
-    
-    try:
-        title_lower = title.lower()
-        
-        keywords_map = {
-            EventType.DOCTORAL_DEFENSE: ['doktori', 'védés', 'phd'],
-            EventType.CONCERT: ['koncert', 'zene', 'szimfónia'],
-            EventType.CONFERENCE: ['konferencia', 'symposium'],
-            EventType.WORKSHOP: ['workshop', 'tanfolyam', 'képzés'],
-            EventType.LECTURE: ['előadás', 'lecture', 'diasor'],
-            EventType.DEADLINE: ['határidő', 'deadline', 'pályázat'],
-        }
-        
-        for event_type, keywords in keywords_map.items():
-            if any(keyword in title_lower for keyword in keywords):
-                return event_type
-        
-        return EventType.OTHER
-        
-    except Exception as e:
-        logger.error(f"Error detecting event type: {e}")
-        return EventType.OTHER
+
+    title_lower = title.lower()
+
+    keywords_map = {
+        EventType.DOCTORAL_DEFENSE: ['doktori', 'védés', 'phd'],
+        EventType.CONCERT: ['koncert', 'zene', 'szimfónia'],
+        EventType.CONFERENCE: ['konferencia', 'symposium'],
+        EventType.WORKSHOP: ['workshop', 'tanfolyam', 'képzés'],
+        EventType.LECTURE: ['előadás', 'lecture', 'diasor'],
+        EventType.DEADLINE: ['határidő', 'deadline', 'pályázat'],
+    }
+
+    for event_type, keywords in keywords_map.items():
+        if any(keyword in title_lower for keyword in keywords):
+            return event_type
+
+    return EventType.OTHER
 
 # ============================================================================
 # MCP SERVER SETUP
@@ -559,9 +544,13 @@ async def call_mcp_tool(name: str, arguments: dict) -> dict:
         
         try:
             if name == "parse_html_and_extract_news":
+                validated_request = HTMLParseRequest(
+                    html_content=arguments.get("html_content", ""),
+                    source_url=arguments.get("source_url", "")
+                )
                 result = await parse_html_and_extract_news(
-                    arguments.get("html_content", ""),
-                    arguments.get("source_url", "")
+                    validated_request.html_content,
+                    str(validated_request.source_url)
                 )
             elif name == "detect_events_from_content":
                 result = await detect_events_from_content(
@@ -965,16 +954,16 @@ async def enrich_with_registration_link(
         event_date = event.get("date", "").strip()
         
         if platform == PlatformType.FACEBOOK.value:
-            enriched["content"] += f"\n\n📅 {quote(event_title, safe='')} ({event_date})\n🔗 Regisztrálj: {registration_url}"
+            enriched["content"] += f"\n\n📅 {event_title} ({event_date})\n🔗 Regisztrálj: {registration_url}"
         
         elif platform == PlatformType.LINKEDIN.value:
-            enriched["body"] += f"\n\n🎯 {quote(event_title, safe='')}\n🗓️ {event_date}\n\n👉 {registration_url}"
+            enriched["body"] += f"\n\n🎯 {event_title}\n🗓️ {event_date}\n\n👉 {registration_url}"
         
         elif platform == PlatformType.X.value:
             enriched["content"] = enriched.get("content", "")[:250] + f"\n🔗 {registration_url}"
         
         elif platform == PlatformType.INSTAGRAM.value:
-            enriched["caption"] = enriched.get("caption", "") + f"\n\n📌 {quote(event_title, safe='')}\n{registration_url}"
+            enriched["caption"] = enriched.get("caption", "") + f"\n\n📌 {event_title}\n{registration_url}"
         
         elif platform == PlatformType.DISCORD.value:
             if "embed_fields" not in enriched:
@@ -1068,7 +1057,12 @@ async def root():
         "status": "running",
         "service": "News to Social Media MCP Server",
         "version": "1.0.0",
-        "mcp_endpoint": "http://fastmcp-server:8000/mcp/tool",
+        "endpoints": {
+            "mcp_jsonrpc": "http://fastmcp-server:8000/mcp",
+            "mcp_tool": "http://fastmcp-server:8000/mcp/tool",
+            "mcp_tools": "http://fastmcp-server:8000/mcp/tools",
+            "health": "http://fastmcp-server:8000/health"
+        },
         "auth_required": False,
         "api_docs": "http://fastmcp-server:8000/docs"
     }
@@ -1090,8 +1084,80 @@ async def list_tools_api():
         "count": len(tools)
     }
 
+@app.post("/mcp", response_model=dict)
+async def mcp_jsonrpc_handler(raw_request: dict = Body(...)):
+    """MCP JSON-RPC endpoint compatible with n8n MCP Client."""
+    request_id = raw_request.get("id")
+    method = raw_request.get("method")
+    params = raw_request.get("params", {})
+
+    try:
+        if method == "tools/list":
+            tools = await list_mcp_tools()
+            return {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {
+                    "tools": [
+                        {
+                            "name": t.name,
+                            "description": t.description,
+                            "inputSchema": t.inputSchema,
+                        }
+                        for t in tools
+                    ]
+                },
+            }
+
+        if method == "tools/call":
+            tool_name = params.get("name")
+            tool_args = params.get("arguments", {})
+
+            if not tool_name:
+                return {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "error": {"code": -32602, "message": "Missing required parameter: name"},
+                }
+
+            result = await call_mcp_tool(tool_name, tool_args)
+            if result.get("isError", False):
+                content = result.get("content", [])
+                error_text = content[0].get("text", "Unknown error") if content else "Unknown error"
+                return {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "error": {"code": -32603, "message": error_text},
+                }
+
+            content = result.get("content", [])
+            result_text = content[0].get("text", "") if content else ""
+            try:
+                parsed_result = json.loads(result_text)
+            except json.JSONDecodeError:
+                parsed_result = {"raw_result": result_text}
+
+            return {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": parsed_result,
+            }
+
+        return {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "error": {"code": -32601, "message": f"Method not found: {method}"},
+        }
+    except Exception as e:
+        logger.exception(f"Unexpected error in MCP JSON-RPC handler: {e}")
+        return {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "error": {"code": -32603, "message": f"Internal server error: {str(e)}"},
+        }
+
 @app.post("/mcp/tool", response_model=ToolResponse)
-async def call_tool_api(raw_request: dict = Body(...)):
+async def call_tool_api(request: ToolRequest):
     """
     MCP Tool hívás HTTP JSON-RPC protokollon
     
@@ -1109,16 +1175,8 @@ async def call_tool_api(raw_request: dict = Body(...)):
     """
     try:
         # Validate request structure
-        name = raw_request.get("name")
-        arguments = raw_request.get("arguments", {})
-
-        if not name or not isinstance(name, str):
-            logger.warning("Invalid request: missing or non-string 'name'")
-            return ToolResponse(status="error", error="Invalid request: 'name' (string) is required")
-
-        if not isinstance(arguments, dict):
-            logger.warning(f"Invalid request: arguments must be dict, got {type(arguments)}")
-            return ToolResponse(status="error", error="Invalid request: 'arguments' must be a dict")
+        name = request.name
+        arguments = request.arguments
 
         logger.info(f"Processing tool call: {name}")
         result = await call_mcp_tool(name, arguments)
@@ -1130,7 +1188,10 @@ async def call_tool_api(raw_request: dict = Body(...)):
             if content and len(content) > 0:
                 error_text = content[0].get("text", "Unknown error") if isinstance(content[0], dict) else str(content[0])
             logger.error(f"Tool error: {error_text}")
-            return ToolResponse(status="error", error=error_text)
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=error_text
+            )
         
         # Sikeres hívás
         result_text = ""
@@ -1146,9 +1207,14 @@ async def call_tool_api(raw_request: dict = Body(...)):
         
         return ToolResponse(status="success", result=result_json)
     
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception(f"Unexpected error in call_tool_api: {e}")
-        return ToolResponse(status="error", error=f"Server error: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Server error: {str(e)}"
+        )
 
 def run_server():
     """HTTP szerver indítása (szinkron)"""
