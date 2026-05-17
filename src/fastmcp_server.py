@@ -134,62 +134,103 @@ class NewsItem(BaseModel):
     publish_date: Optional[str] = None
     events: List[EventDetected] = Field(default_factory=list)
 
-class SocialPostFacebook(BaseModel):
-    content: str = Field(..., description="Facebook poszt szövege (max 63.206 karakter)")
-    hashtags: List[str] = Field(default_factory=list)
-    image_description: Optional[str] = None
-    cta_button: Optional[str] = Field(None, description="Call-to-action gomb szövege")
-    cta_url: Optional[str] = None
-
-class SocialPostLinkedIn(BaseModel):
-    headline: str = Field(..., description="LinkedIn headline (max 200 karakter)")
-    body: str = Field(..., description="LinkedIn poszt szövege")
-    hashtags: List[str] = Field(default_factory=list)
-    cta_text: str = Field(default="Tudj meg többet", description="Call-to-action szöveg")
-    cta_url: Optional[str] = None
-
-class SocialPostX(BaseModel):
-    content: str = Field(..., description="X poszt (max 280 karakter)")
-    hashtags: List[str] = Field(default_factory=list)
-
-class SocialPostInstagram(BaseModel):
-    caption: str = Field(..., description="Instagram felirat (max 2.200 karakter)")
-    hashtags: List[str] = Field(default_factory=list)
-    emoji_usage: Optional[str] = None
-
-class SocialPostDiscord(BaseModel):
-    embed_title: str
-    embed_description: str
-    embed_fields: Dict[str, str] = Field(default_factory=dict)
-    embed_color: int = Field(default=3447003, description="Discord embed szín (hex)")
-
-class SocialPostsResponse(BaseModel):
-    """Összes platform posztja"""
-    facebook: Optional[SocialPostFacebook] = None
-    linkedin: Optional[SocialPostLinkedIn] = None
-    x: Optional[SocialPostX] = None
-    instagram: Optional[SocialPostInstagram] = None
-    discord: Optional[SocialPostDiscord] = None
-
-class NewsAnalysisResponse(BaseModel):
-    """Teljes hírelemzés eredmény"""
-    news_items: List[NewsItem]
-    total_events_detected: int
-    total_posts_generated: int
-
-class ToolCallRequest(BaseModel):
-    """MCP Tool hívás request"""
-    name: str = Field(..., description="Tool neve")
-    arguments: Dict[str, Any] = Field(..., description="Tool paraméterei")
-
-class ToolCallResponse(BaseModel):
-    """MCP Tool response"""
-    status: str = Field(default="success")
-    result: Optional[Dict[str, Any]] = None
-    error: Optional[str] = None
+# NOTE: Social post models (SocialPostFacebook, etc.) are generated dynamically as dicts
+# in generate_social_posts() function. Legacy Pydantic models removed (code smell #3).
 
 # ============================================================================
 # HELPER FUNCTIONS - Common parsing utilities
+# ============================================================================
+
+# ============================================================================
+# EXTRACTION HELPERS - Code smell #4 refactoring
+# ============================================================================
+
+def _extract_tmit_news(soup, source_url: str) -> List[Dict[str, Any]]:
+    """Extract TMIT news articles from soup"""
+    news_items = []
+    try:
+        sel = HTML_SELECTORS["tmit"]
+        tmit_articles = soup.find_all(sel["article"]["tag"], class_=sel["article"]["class"])
+        for article in tmit_articles:
+            html_str = str(article)
+            news = parse_tmit_news(html_str, source_url)
+            if news:
+                news_items.append(news.model_dump())
+        logger.info(f"Found {len(tmit_articles)} TMIT articles")
+    except Exception as e:
+        logger.error(f"Error parsing TMIT articles: {e}")
+    return news_items
+
+def _extract_vik_news(soup, source_url: str) -> List[Dict[str, Any]]:
+    """Extract VIK news from soup"""
+    news_items = []
+    try:
+        sel = HTML_SELECTORS["vik"]
+        vik_news = soup.find_all(sel["title"]["tag"], class_=sel["title"]["class"])
+        for news_elem in vik_news:
+            parent_div = news_elem.find_parent(sel["parent"]["tag"], class_=sel["parent"]["class"])
+            if parent_div:
+                html_str = str(parent_div)
+                news = parse_vik_news(html_str, source_url)
+                if news:
+                    news_items.append(news.model_dump())
+        logger.info(f"Found {len(vik_news)} VIK news items")
+    except Exception as e:
+        logger.error(f"Error parsing VIK news: {e}")
+    return news_items
+
+def _extract_bme_news(soup, source_url: str) -> List[Dict[str, Any]]:
+    """Extract BME news cards from soup"""
+    news_items = []
+    try:
+        sel = HTML_SELECTORS["bme_news"]
+        bme_news = soup.find_all(sel["card"]["tag"], class_=sel["card"]["class"])
+        for news_card in bme_news:
+            html_str = str(news_card)
+            news = parse_bme_news(html_str, source_url)
+            if news:
+                news_items.append(news.model_dump())
+        logger.info(f"Found {len(bme_news)} BME news cards")
+    except Exception as e:
+        logger.error(f"Error parsing BME news: {e}")
+    return news_items
+
+def _extract_bme_events(soup, source_url: str) -> List[Dict[str, Any]]:
+    """Extract BME events from soup"""
+    events = []
+    try:
+        sel = HTML_SELECTORS["bme_event"]
+        bme_events = soup.find_all(sel["date_container"]["tag"], class_=sel["date_container"]["class"])
+        for event_card in bme_events:
+            parent = event_card.find_parent(sel["parent"]["tag"], class_=sel["parent"]["class"])
+            if parent:
+                html_str = str(parent)
+                event = parse_bme_event(html_str, source_url)
+                if event:
+                    events.append(event.model_dump())
+        logger.info(f"Found {len(bme_events)} BME events")
+    except Exception as e:
+        logger.error(f"Error parsing BME events: {e}")
+    return events
+
+def _extract_simple_events(soup, source_url: str) -> List[Dict[str, Any]]:
+    """Extract simple events from soup"""
+    events = []
+    try:
+        sel = HTML_SELECTORS["simple_event"]
+        simple_events = soup.find_all(sel["container"]["tag"], class_=sel["container"]["class"])
+        for event_elem in simple_events:
+            html_str = str(event_elem)
+            event = parse_simple_event(html_str, source_url)
+            if event:
+                events.append(event.model_dump())
+        logger.info(f"Found {len(simple_events)} simple events")
+    except Exception as e:
+        logger.error(f"Error parsing simple events: {e}")
+    return events
+
+# ============================================================================
+# PARSING HELPER FUNCTIONS
 # ============================================================================
 
 def safe_find_text(element, *args, **kwargs) -> Optional[str]:
@@ -617,77 +658,17 @@ async def parse_html_and_extract_news(html_content: str, source_url: str) -> Dic
             }
         
         soup = BeautifulSoup(html_content, **HTML_PARSER_CONFIG)
-        news_items = []
-        events = []
         
-        # TMIT hírek
-        try:
-            sel = HTML_SELECTORS["tmit"]
-            tmit_articles = soup.find_all(sel["article"]["tag"], class_=sel["article"]["class"])
-            for article in tmit_articles:
-                html_str = str(article)
-                news = parse_tmit_news(html_str, source_url)
-                if news:
-                    news_items.append(news.model_dump())
-            logger.info(f"Found {len(tmit_articles)} TMIT articles")
-        except Exception as e:
-            logger.error(f"Error parsing TMIT articles: {e}")
+        # Extract news and events using helper functions
+        tmit_news = _extract_tmit_news(soup, source_url)
+        vik_news = _extract_vik_news(soup, source_url)
+        bme_news = _extract_bme_news(soup, source_url)
+        bme_events = _extract_bme_events(soup, source_url)
+        simple_events = _extract_simple_events(soup, source_url)
         
-        # VIK hírek
-        try:
-            sel = HTML_SELECTORS["vik"]
-            vik_news = soup.find_all(sel["title"]["tag"], class_=sel["title"]["class"])
-            for news_elem in vik_news:
-                parent_div = news_elem.find_parent(sel["parent"]["tag"], class_=sel["parent"]["class"])
-                if parent_div:
-                    html_str = str(parent_div)
-                    news = parse_vik_news(html_str, source_url)
-                    if news:
-                        news_items.append(news.model_dump())
-            logger.info(f"Found {len(vik_news)} VIK news items")
-        except Exception as e:
-            logger.error(f"Error parsing VIK news: {e}")
-        
-        # BME hírek
-        try:
-            sel = HTML_SELECTORS["bme_news"]
-            bme_news = soup.find_all(sel["card"]["tag"], class_=sel["card"]["class"])
-            for news_card in bme_news:
-                html_str = str(news_card)
-                news = parse_bme_news(html_str, source_url)
-                if news:
-                    news_items.append(news.model_dump())
-            logger.info(f"Found {len(bme_news)} BME news cards")
-        except Exception as e:
-            logger.error(f"Error parsing BME news: {e}")
-        
-        # BME események
-        try:
-            sel = HTML_SELECTORS["bme_event"]
-            bme_events = soup.find_all(sel["date_container"]["tag"], class_=sel["date_container"]["class"])
-            for event_card in bme_events:
-                parent = event_card.find_parent(sel["parent"]["tag"], class_=sel["parent"]["class"])
-                if parent:
-                    html_str = str(parent)
-                    event = parse_bme_event(html_str, source_url)
-                    if event:
-                        events.append(event.model_dump())
-            logger.info(f"Found {len(bme_events)} BME events")
-        except Exception as e:
-            logger.error(f"Error parsing BME events: {e}")
-        
-        # Egyszerű események
-        try:
-            sel = HTML_SELECTORS["simple_event"]
-            simple_events = soup.find_all(sel["container"]["tag"], class_=sel["container"]["class"])
-            for event_elem in simple_events:
-                html_str = str(event_elem)
-                event = parse_simple_event(html_str, source_url)
-                if event:
-                    events.append(event.model_dump())
-            logger.info(f"Found {len(simple_events)} simple events")
-        except Exception as e:
-            logger.error(f"Error parsing simple events: {e}")
+        # Combine all results
+        news_items = tmit_news + vik_news + bme_news
+        events = bme_events + simple_events
         
         logger.info(f"Total extracted: {len(news_items)} news, {len(events)} events")
         return {
@@ -1070,12 +1051,12 @@ async def health():
     }
 
 class ToolRequest(BaseModel):
-    """Tool hívás request"""
+    """HTTP Tool hívás request"""
     name: str
     arguments: Dict[str, Any] = Field(default_factory=dict)
 
 class ToolResponse(BaseModel):
-    """Tool response"""
+    """HTTP Tool response"""
     status: str
     result: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
