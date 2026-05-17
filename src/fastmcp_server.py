@@ -948,8 +948,7 @@ async def lifespan(app: FastAPI):
     logger.info(f"HTML Parser: {HTML_PARSER_CONFIG}")
     logger.info("=" * 60)
 
-    async with mcp.session_manager.run():
-        yield
+    yield
 
     logger.info("=" * 60)
     logger.info("News to Social Media MCP Server shutting down")
