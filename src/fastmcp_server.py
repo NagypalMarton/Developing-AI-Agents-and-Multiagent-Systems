@@ -106,6 +106,14 @@ class HTMLParseRequest(BaseModel):
             raise ValueError("HTML tartalom nem lehet üres")
         return v
 
+class SocialMediaPosts(BaseModel):
+    """Közösségi média posztok gyűjtménye"""
+    facebook: Optional[str] = Field(None, description="Facebook poszt szövege")
+    linkedin: Optional[str] = Field(None, description="LinkedIn poszt szövege")
+    x: Optional[str] = Field(None, description="X (Twitter) poszt szövege")
+    instagram: Optional[str] = Field(None, description="Instagram poszt szövege")
+    discord: Optional[str] = Field(None, description="Discord embed szövege")
+
 class EventDetected(BaseModel):
     """Detektált esemény"""
     title: str = Field(..., description="Esemény címe")
@@ -115,6 +123,18 @@ class EventDetected(BaseModel):
     description: str = Field(..., description="Esemény leírása")
     registration_url: Optional[str] = Field(None, description="Regisztrációs URL")
     source_url: Optional[str] = Field(None, description="Forrás URL")
+    social_posts: Optional[SocialMediaPosts] = Field(None, description="Közösségi média posztok")
+class EventDetected(BaseModel):
+    """Detektált esemény"""
+    title: str = Field(..., description="Esemény címe")
+    date: str = Field(..., description="Esemény dátuma (YYYY.MMM.DD. formátumban)")
+    source_url: Optional[str] = Field(None, description="Forrás URL")
+    content: str = Field(..., description="Esemény leírása/tartalma")
+    location: Optional[str] = Field(None, description="Esemény helyszíne")
+    event_type: EventType = Field(default=EventType.OTHER)
+    description: str = Field(..., description="Esemény leírása")
+    registration_url: Optional[str] = Field(None, description="Regisztrációs URL")
+    social_posts: Optional[SocialMediaPosts] = Field(None, description="Közösségi média posztok")
 
 class NewsItem(BaseModel):
     """Kinyert hírelemek"""
@@ -124,6 +144,7 @@ class NewsItem(BaseModel):
     source_url: str
     publish_date: Optional[str] = None
     events: List[EventDetected] = Field(default_factory=list)
+    social_posts: Optional[SocialMediaPosts] = Field(None, description="Közösségi média posztok")
 
 # NOTE: Social post models (SocialPostFacebook, etc.) are generated dynamically as dicts
 # in generate_social_posts() function. Legacy Pydantic models removed (code smell #3).
@@ -146,6 +167,8 @@ def _extract_tmit_news(soup, source_url: str) -> List[Dict[str, Any]]:
             html_str = str(article)
             news = parse_tmit_news(html_str, source_url)
             if news:
+                # Szociális média posztok generálása
+                news.social_posts = _generate_default_social_posts(news.title, news.content, news.source_url)
                 news_items.append(news.model_dump(mode="json", exclude_none=False))
         logger.info(f"Found {len(tmit_articles)} TMIT articles")
     except (AttributeError, TypeError, ValueError) as e:
@@ -164,6 +187,8 @@ def _extract_vik_news(soup, source_url: str) -> List[Dict[str, Any]]:
                 html_str = str(parent_div)
                 news = parse_vik_news(html_str, source_url)
                 if news:
+                    # Szociális média posztok generálása
+                    news.social_posts = _generate_default_social_posts(news.title, news.content, news.source_url)
                     news_items.append(news.model_dump(mode="json", exclude_none=False))
         logger.info(f"Found {len(vik_news)} VIK news items")
     except (AttributeError, TypeError, ValueError) as e:
@@ -180,6 +205,8 @@ def _extract_bme_news(soup, source_url: str) -> List[Dict[str, Any]]:
             html_str = str(news_card)
             news = parse_bme_news(html_str, source_url)
             if news:
+                # Szociális média posztok generálása
+                news.social_posts = _generate_default_social_posts(news.title, news.content, news.source_url)
                 news_items.append(news.model_dump(mode="json", exclude_none=False))
         logger.info(f"Found {len(bme_news)} BME news cards")
     except (AttributeError, TypeError, ValueError) as e:
@@ -198,6 +225,11 @@ def _extract_bme_events(soup, source_url: str) -> List[Dict[str, Any]]:
                 html_str = str(parent)
                 event = parse_bme_event(html_str, source_url)
                 if event:
+                    # Szociális média posztok generálása eseményre
+                    event.social_posts = _generate_default_social_posts(
+                        event.title, event.description, event.source_url or source_url,
+                        event_title=event.title, event_date=event.date
+                    )
                     events.append(event.model_dump(mode="json", exclude_none=False))
         logger.info(f"Found {len(bme_events)} BME events")
     except (AttributeError, TypeError, ValueError) as e:
@@ -214,6 +246,11 @@ def _extract_simple_events(soup, source_url: str) -> List[Dict[str, Any]]:
             html_str = str(event_elem)
             event = parse_simple_event(html_str, source_url)
             if event:
+                # Szociális média posztok generálása eseményre
+                event.social_posts = _generate_default_social_posts(
+                    event.title, "Esemény meghívó", event.source_url or source_url,
+                    event_title=event.title, event_date=event.date
+                )
                 events.append(event.model_dump(mode="json", exclude_none=False))
         logger.info(f"Found {len(simple_events)} simple events")
     except (AttributeError, TypeError, ValueError) as e:
@@ -351,7 +388,8 @@ def parse_tmit_news(html_content: str, source_url: str) -> Optional[NewsItem]:
             title=title,
             content=content,
             image_url=image_url,
-            source_url=str(source_url)
+            source_url=str(source_url),
+            social_posts=None
         )
     except (AttributeError, TypeError, ValueError) as e:
         logger.error(f"Error parsing TMIT news: {e}")
@@ -379,7 +417,8 @@ def parse_vik_news(html_content: str, source_url: str) -> Optional[NewsItem]:
             content=content,
             image_url=image_url,
             source_url=str(source_url),
-            publish_date=publish_date
+            publish_date=publish_date,
+            social_posts=None
         )
     except (AttributeError, TypeError, ValueError) as e:
         logger.error(f"Error parsing VIK news: {e}")
@@ -407,7 +446,8 @@ def parse_bme_news(html_content: str, source_url: str) -> Optional[NewsItem]:
             content=content,
             image_url=image_url,
             source_url=str(source_url),
-            publish_date=publish_date
+            publish_date=publish_date,
+            social_posts=None
         )
     except (AttributeError, TypeError, ValueError) as e:
         logger.error(f"Error parsing BME news: {e}")
@@ -434,7 +474,8 @@ def parse_bme_event(html_content: str, source_url: str) -> Optional[EventDetecte
             event_type=event_type,
             description=description,
             registration_url=None,
-            source_url=str(source_url)
+            source_url=str(source_url),
+            social_posts=None
         )
     except (AttributeError, TypeError, ValueError) as e:
         logger.error(f"Error parsing BME event: {e}")
@@ -456,7 +497,8 @@ def parse_simple_event(html_content: str, source_url: str) -> Optional[EventDete
             event_type=EventType.OTHER,
             description="",
             registration_url=None,
-            source_url=str(source_url)
+            source_url=str(source_url),
+            social_posts=None
         )
     except (AttributeError, TypeError, ValueError) as e:
         logger.error(f"Error parsing simple event: {e}")
@@ -517,6 +559,58 @@ def detect_event_type(title: str) -> EventType:
             return event_type
 
     return EventType.OTHER
+
+def _generate_default_social_posts(title: str, content: str, source_url: str, 
+                                   event_title: Optional[str] = None,
+                                   event_date: Optional[str] = None) -> SocialMediaPosts:
+    """Alapértelmezett szociális média posztok generálása"""
+    try:
+        # Szöveg rövidítések platform specifikus maximális hosszakhoz
+        content_short = content[:200] if content else ""
+        
+        facebook_text = f"""📰 {title}
+
+{content}
+
+🔗 Tudj meg többet: {source_url}"""
+        if event_title and event_date:
+            facebook_text += f"\n\n📅 {event_title} ({event_date})"
+        facebook_text = facebook_text[:FACEBOOK_MAX_LENGTH]
+        
+        linkedin_text = f"""{title}
+
+{content}
+
+📌 Forrás: {source_url}
+
+#BME #Hírek #Oktatás"""
+        if event_title and event_date:
+            linkedin_text += f"\n\n🎯 Esemény: {event_title}\n🗓️ Dátum: {event_date}"
+        linkedin_text = linkedin_text[:LINKEDIN_HEADLINE_MAX * 10]  # Becsült korlát
+        
+        x_text = f"{title}\n\n{content_short}...\n\n{source_url}"
+        x_text = x_text[:X_MAX_LENGTH]
+        
+        instagram_text = f"{title}\n.\n{content}\n\n#BME #Egyetem #Hírek"
+        if event_title:
+            instagram_text += f"\n#Esemény"
+        instagram_text = instagram_text[:INSTAGRAM_MAX_LENGTH]
+        
+        discord_text = f"**{title}**\n\n{content}\n\n[Tudj meg többet]({source_url})"
+        if event_title and event_date:
+            discord_text += f"\n\n📅 **{event_title}** - {event_date}"
+        discord_text = discord_text[:DISCORD_DESCRIPTION_MAX]
+        
+        return SocialMediaPosts(
+            facebook=facebook_text,
+            linkedin=linkedin_text,
+            x=x_text,
+            instagram=instagram_text,
+            discord=discord_text
+        )
+    except Exception as e:
+        logger.warning(f"Error generating default social posts: {e}")
+        return SocialMediaPosts(facebook=None, linkedin=None, x=None, instagram=None, discord=None)
 
 # ============================================================================
 # MCP SERVER SETUP
