@@ -1,17 +1,15 @@
  
-import json
 import re
 import logging
 from datetime import datetime
-from typing import List, Optional, Dict, Any, cast
+from typing import List, Optional, Dict, Any
 from enum import Enum
 from urllib.parse import urlparse
 from contextlib import asynccontextmanager
 from pydantic import BaseModel, Field, field_validator, HttpUrl
 from bs4 import BeautifulSoup
-from mcp.server import Server
-from mcp.types import Tool
-from fastapi import FastAPI, Body, HTTPException, status
+from mcp.server.fastmcp import FastMCP
+from fastapi import FastAPI
 import uvicorn
 
 # Configure logging
@@ -110,7 +108,7 @@ class HTMLParseRequest(BaseModel):
 class EventDetected(BaseModel):
     """Detektált esemény"""
     title: str = Field(..., description="Esemény címe")
-    date: str = Field(..., description="Esemény dátuma (YYYY-MM-DD HH:MM formátumban)")
+    date: str = Field(..., description="Esemény dátuma (YYYY.MMM.DD. formátumban)")
     location: Optional[str] = Field(None, description="Esemény helyszíne")
     event_type: EventType = Field(default=EventType.OTHER)
     description: str = Field(..., description="Esemény leírása")
@@ -265,8 +263,68 @@ def validate_url_safety(url: Optional[str]) -> Optional[str]:
 
 # Pre-compiled regex patterns
 REGEX_HUNGARIAN_DATE = re.compile(r'(\d{4})\D+(\d{1,2})\D+(\d{1,2})')
+REGEX_HUMAN_DATE = re.compile(r'(\d{4})[.\-/\s]+([A-Za-z]{3,9})[.\-/\s]+(\d{1,2})(?:\.)?')
 REGEX_TIME = re.compile(r'(\d{1,2}):(\d{2})')
 REGEX_LOCATION = re.compile(r'(?:helyszín|location|hely)[\s:]*([^,.\n]+)', re.IGNORECASE)
+
+MONTH_ABBREVIATIONS = {
+    1: "Jan",
+    2: "Feb",
+    3: "Mar",
+    4: "Apr",
+    5: "May",
+    6: "Jun",
+    7: "Jul",
+    8: "Aug",
+    9: "Sep",
+    10: "Oct",
+    11: "Nov",
+    12: "Dec",
+}
+
+MONTH_NAME_TO_NUMBER = {
+    "jan": 1,
+    "january": 1,
+    "feb": 2,
+    "february": 2,
+    "mar": 3,
+    "march": 3,
+    "apr": 4,
+    "april": 4,
+    "may": 5,
+    "jun": 6,
+    "june": 6,
+    "jul": 7,
+    "july": 7,
+    "aug": 8,
+    "august": 8,
+    "sep": 9,
+    "sept": 9,
+    "september": 9,
+    "oct": 10,
+    "october": 10,
+    "nov": 11,
+    "november": 11,
+    "dec": 12,
+    "december": 12,
+}
+
+
+def _format_human_date(date_value: datetime) -> str:
+    return f"{date_value.year}.{MONTH_ABBREVIATIONS[date_value.month]}.{date_value.day:02d}."
+
+
+def _month_name_to_number(month_name: str) -> Optional[int]:
+    normalized = month_name.strip().lower().rstrip(".")
+    return MONTH_NAME_TO_NUMBER.get(normalized)
+
+
+def _build_human_date_string(year: int, month: int, day: int) -> Optional[str]:
+    try:
+        return _format_human_date(datetime(year, month, day))
+    except ValueError as e:
+        logger.warning(f"Invalid date components: {year}-{month}-{day}: {e}")
+        return None
 
 # ============================================================================
 # HTML PARSER UTILS
@@ -408,35 +466,34 @@ def parse_simple_event(html_content: str, source_url: str) -> Optional[EventDete
 # ============================================================================
 
 def parse_date_string(date_str: str) -> str:
-    """Magyar dátum stringet ISO formátumra alakít - ROBUST ERROR HANDLING"""
+    """Dátum stringet YYYY.MMM.DD. formátumra alakít - ROBUST ERROR HANDLING"""
     if not date_str or not isinstance(date_str, str):
         logger.warning(f"Invalid date_str: {date_str}")
-        return datetime.now().isoformat()
+        return _format_human_date(datetime.now())
     
     try:
-        # Dátum és idő extraktálása regex-szel
+        human_match = REGEX_HUMAN_DATE.search(date_str)
+        if human_match:
+            year_str, month_name, day_str = human_match.groups()
+            month_number = _month_name_to_number(month_name)
+            if month_number:
+                result = _build_human_date_string(int(year_str), month_number, int(day_str))
+                if result:
+                    return result
+
         date_match = REGEX_HUNGARIAN_DATE.search(date_str)
-        if not date_match:
-            logger.debug(f"No date pattern found in: {date_str}")
-            return datetime.now().isoformat()
-        
-        year, month, day = date_match.groups()
-        
-        # Idő keresése
-        time_match = REGEX_TIME.search(date_str)
-        if time_match:
-            hour, minute = time_match.groups()
-            result = f"{year}-{month.zfill(2)}-{day.zfill(2)}T{hour.zfill(2)}:{minute}:00"
-        else:
-            result = f"{year}-{month.zfill(2)}-{day.zfill(2)}T00:00:00"
-        
-        # Validate the resulting ISO date
-        datetime.fromisoformat(result)
-        return result
+        if date_match:
+            year_str, month_str, day_str = date_match.groups()
+            result = _build_human_date_string(int(year_str), int(month_str), int(day_str))
+            if result:
+                return result
+
+        logger.debug(f"No date pattern found in: {date_str}")
+        return _format_human_date(datetime.now())
         
     except (ValueError, TypeError, AttributeError) as e:
         logger.warning(f"Date parsing validation failed for '{date_str}': {e}")
-        return datetime.now().isoformat()
+        return _format_human_date(datetime.now())
 
 def detect_event_type(title: str) -> EventType:
     """Eseménytípus detektálása a címből - TYPE SAFE"""
@@ -464,158 +521,9 @@ def detect_event_type(title: str) -> EventType:
 # MCP SERVER SETUP
 # ============================================================================
 
-server = Server("news-to-social-agent")
+mcp = FastMCP("news-to-social-agent")
 
-def _build_tools() -> list[Tool]:
-    """Create MCP tool definitions for both MCP and HTTP APIs."""
-    return [
-        Tool(
-            name="parse_html_and_extract_news",
-            description="HTML feldolgozás és hírek + események extraktálása. Támogatott formátumok: TMIT (node-hir), VIK (news-title-important), BME (bme_news_card), BME events",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "html_content": {"type": "string", "description": "HTML tartalom"},
-                    "source_url": {"type": "string", "description": "Forrás URL"}
-                },
-                "required": ["html_content", "source_url"]
-            }
-        ),
-        Tool(
-            name="detect_events_from_content",
-            description="Eseményadatok detektálása szövegből regex alapú keresés",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "content": {"type": "string", "description": "Szöveg tartalom"},
-                    "current_date": {"type": "string", "description": "Aktuális dátum (ISO format, opcional)"}
-                },
-                "required": ["content"]
-            }
-        ),
-        Tool(
-            name="generate_social_posts",
-            description="Platform-specifikus szociálmédiai posztok generálása (Facebook, LinkedIn, X, Instagram, Discord)",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "news_title": {"type": "string"},
-                    "news_content": {"type": "string"},
-                    "source_url": {"type": "string"},
-                    "events": {"type": "array", "description": "Eseményadatok (opcional)"},
-                    "platforms": {"type": "array", "items": {"type": "string"}, "description": "Platform nevek (opcional, default: mind)"}
-                },
-                "required": ["news_title", "news_content", "source_url"]
-            }
-        ),
-        Tool(
-            name="enrich_with_registration_link",
-            description="Regisztrációs link injektálása az eseményt tartalmazó posztokba",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "post": {"type": "object", "description": "Poszt objektum"},
-                    "event": {"type": "object", "description": "Event objektum"},
-                    "platform": {"type": "string", "description": "Platform neve"}
-                },
-                "required": ["post", "event", "platform"]
-            }
-        )
-    ]
-
-@server.list_tools()
-async def list_mcp_tools() -> list[Tool]:
-    """List available MCP tools"""
-    return _build_tools()
-
-@server.call_tool()
-async def call_mcp_tool(name: str, arguments: dict) -> dict:
-    """
-    Handle MCP tool calls with proper error handling.
-    
-    Raises:
-    - ValueError: Ha a tool nem létezik vagy arguments invalid
-    - Specific exceptions logged with context
-    """
-    try:
-        # Input validation
-        if not name or not isinstance(name, str):
-            logger.error("Invalid tool name: must be non-empty string")
-            raise ValueError("Invalid tool name")
-        
-        if not isinstance(arguments, dict):
-            logger.error(f"Invalid arguments: must be dict, got {type(arguments)}")
-            raise ValueError("Invalid arguments format")
-        
-        logger.debug(f"Calling tool: {name} with args keys: {list(arguments.keys())}")
-        
-        try:
-            if name == "parse_html_and_extract_news":
-                validated_request = HTMLParseRequest(
-                    html_content=arguments.get("html_content", ""),
-                    source_url=arguments.get("source_url", "")
-                )
-                result = await parse_html_and_extract_news(
-                    validated_request.html_content,
-                    str(validated_request.source_url)
-                )
-            elif name == "detect_events_from_content":
-                result = await detect_events_from_content(
-                    arguments.get("content", ""),
-                    arguments.get("current_date") if isinstance(arguments.get("current_date"), str) else None
-                )
-            elif name == "generate_social_posts":
-                events = arguments.get("events")
-                platforms = arguments.get("platforms")
-                result = await generate_social_posts(
-                    arguments.get("news_title", ""),
-                    arguments.get("news_content", ""),
-                    arguments.get("source_url", ""),
-                    events if isinstance(events, list) else None,
-                    platforms if isinstance(platforms, list) else None
-                )
-            elif name == "enrich_with_registration_link":
-                result = await enrich_with_registration_link(
-                    arguments.get("post", {}),
-                    arguments.get("event", {}),
-                    arguments.get("platform", "")
-                )
-            else:
-                logger.warning(f"Unknown tool requested: {name}")
-                raise ValueError(f"Unknown tool: {name}")
-            
-            logger.info(f"Tool {name} executed successfully")
-            return {
-                "isError": False,
-                "content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False, indent=2)}]
-            }
-        
-        except ValueError as e:
-            logger.error(f"Validation error in tool {name}: {e}")
-            raise
-        except KeyError as e:
-            logger.error(f"Missing argument in tool {name}: {e}")
-            raise ValueError(f"Missing required argument: {str(e)}")
-        except TypeError as e:
-            logger.error(f"Type error in tool {name}: {e}")
-            raise ValueError(f"Type error: {str(e)}")
-        except Exception as e:
-            logger.exception(f"Unexpected error in tool {name}: {e}")
-            raise
-    
-    except ValueError as e:
-        logger.error(f"ValueError calling tool {name}: {e}")
-        return {
-            "isError": True,
-            "content": [{"type": "text", "text": f"Validation error: {str(e)}"}]
-        }
-    except Exception as e:
-        logger.exception(f"Unexpected error calling tool {name}: {e}")
-        return {
-            "isError": True,
-            "content": [{"type": "text", "text": f"Server error: {str(e)}"}]
-        }
-
+@mcp.tool()
 async def parse_html_and_extract_news(html_content: str, source_url: str) -> Dict[str, Any]:
     """
     HTML feldolgozás és hírek + események extraktálása.
@@ -697,6 +605,7 @@ async def parse_html_and_extract_news(html_content: str, source_url: str) -> Dic
             "event_count": 0
         }
 
+@mcp.tool()
 async def detect_events_from_content(content: str, current_date: Optional[str] = None) -> Dict[str, Any]:
     """
     LLM segítségével részletesebb eseményadatok detektálása szövegből.
@@ -713,18 +622,32 @@ async def detect_events_from_content(content: str, current_date: Optional[str] =
             raise ValueError("Content must be non-empty string")
         
         if not current_date:
-            current_date = datetime.now().isoformat()
+            current_date = _format_human_date(datetime.now())
         else:
             # Validate ISO format if provided
             try:
-                datetime.fromisoformat(current_date)
+                parse_date_string(current_date)
             except ValueError as e:
                 logger.warning(f"Invalid date format: {current_date}")
                 raise ValueError(f"Invalid date format: {str(e)}")
         
         # Regex alapú detektálás
         try:
-            dates_found = re.findall(REGEX_HUNGARIAN_DATE.pattern, content)
+            dates_found = []
+            for year_str, month_name, day_str in REGEX_HUMAN_DATE.findall(content):
+                month_number = _month_name_to_number(month_name)
+                if month_number:
+                    formatted_date = _build_human_date_string(int(year_str), month_number, int(day_str))
+                    if formatted_date:
+                        dates_found.append(formatted_date)
+
+            for year_str, month_str, day_str in REGEX_HUNGARIAN_DATE.findall(content):
+                formatted_date = _build_human_date_string(int(year_str), int(month_str), int(day_str))
+                if formatted_date:
+                    dates_found.append(formatted_date)
+
+            # Preserve order while removing duplicates
+            dates_found = list(dict.fromkeys(dates_found))
             locations_found = re.findall(REGEX_LOCATION.pattern, content)
             
             logger.info(f"Found {len(dates_found)} dates and {len(locations_found)} locations")
@@ -757,6 +680,7 @@ async def detect_events_from_content(content: str, current_date: Optional[str] =
             "locations_found": []
         }
 
+@mcp.tool()
 async def generate_social_posts(
     news_title: str,
     news_content: str,
@@ -914,6 +838,7 @@ Tudj meg többet: {validated_source_url}
             "event_count": 0
         }
 
+@mcp.tool()
 async def enrich_with_registration_link(
     post: Dict[str, Any],
     event: Dict[str, Any],
@@ -1016,26 +941,27 @@ async def enrich_with_registration_link(
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """FastAPI lifespan event handler for startup and shutdown"""
-    # Startup
     logger.info("=" * 60)
     logger.info("News to Social Media MCP Server starting up")
     logger.info(f"HTML Parser: {HTML_PARSER_CONFIG}")
     logger.info("=" * 60)
-    
-    yield
-    
-    # Shutdown
+
+    async with mcp.session_manager.run():
+        yield
+
     logger.info("=" * 60)
     logger.info("News to Social Media MCP Server shutting down")
     logger.info("=" * 60)
 
-# FastAPI app HTTP JSON-RPC wrapper MCP szerverhez
+# FastAPI app MCP SSE transporttal
 app = FastAPI(
     title="News to Social Media MCP Server",
-    description="MCP szerver HTTP JSON-RPC wrapper-rel - n8n kompatibilis",
+    description="MCP szerver FastAPI-val és hivatalos MCP SSE transporttal",
     version="1.0.0",
     lifespan=lifespan
 )
+
+app.mount("/mcp", mcp.sse_app())
 
 @app.get("/health")
 async def health():
@@ -1047,17 +973,6 @@ async def health():
         "version": "1.0.0"
     }
 
-class ToolRequest(BaseModel):
-    """HTTP Tool hívás request"""
-    name: str
-    arguments: Dict[str, Any] = Field(default_factory=dict)
-
-class ToolResponse(BaseModel):
-    """HTTP Tool response"""
-    status: str
-    result: Optional[Dict[str, Any]] = None
-    error: Optional[str] = None
-
 @app.get("/")
 async def root():
     """Root endpoint - API information"""
@@ -1067,165 +982,13 @@ async def root():
         "service": "News to Social Media MCP Server",
         "version": "1.0.0",
         "endpoints": {
-            "mcp_jsonrpc": "http://fastmcp-server:8000/mcp",
-            "mcp_tool": "http://fastmcp-server:8000/mcp/tool",
-            "mcp_tools": "http://fastmcp-server:8000/mcp/tools",
+            "mcp_sse": "http://fastmcp-server:8000/mcp/sse",
+            "mcp_messages": "http://fastmcp-server:8000/mcp/messages/",
             "health": "http://fastmcp-server:8000/health"
         },
         "auth_required": False,
         "api_docs": "http://fastmcp-server:8000/docs"
     }
-
-@app.get("/mcp/tools")
-async def list_tools_api():
-    """Elérhető MCP toolok listája"""
-    logger.info("Tool list requested")
-    tools = _build_tools()
-    return {
-        "tools": [
-            {
-                "name": t.name,
-                "description": t.description,
-                "inputSchema": t.inputSchema
-            }
-            for t in tools
-        ],
-        "count": len(tools)
-    }
-
-@app.post("/mcp", response_model=dict)
-async def mcp_jsonrpc_handler(raw_request: dict = Body(...)):
-    """MCP JSON-RPC endpoint compatible with n8n MCP Client."""
-    request_id = raw_request.get("id")
-    method = raw_request.get("method")
-    params = raw_request.get("params", {})
-
-    try:
-        if method == "tools/list":
-            tools = _build_tools()
-            return {
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "result": {
-                    "tools": [
-                        {
-                            "name": t.name,
-                            "description": t.description,
-                            "inputSchema": t.inputSchema,
-                        }
-                        for t in tools
-                    ]
-                },
-            }
-
-        if method == "tools/call":
-            tool_name = params.get("name")
-            tool_args = params.get("arguments", {})
-
-            if not tool_name:
-                return {
-                    "jsonrpc": "2.0",
-                    "id": request_id,
-                    "error": {"code": -32602, "message": "Missing required parameter: name"},
-                }
-
-            raw_result = await call_mcp_tool(tool_name, tool_args)
-            result = cast(Dict[str, Any], raw_result)
-            if result.get("isError", False):
-                content = result.get("content", [])
-                error_text = content[0].get("text", "Unknown error") if content else "Unknown error"
-                return {
-                    "jsonrpc": "2.0",
-                    "id": request_id,
-                    "error": {"code": -32603, "message": error_text},
-                }
-
-            content = result.get("content", [])
-            result_text = content[0].get("text", "") if content else ""
-            try:
-                parsed_result = json.loads(result_text)
-            except json.JSONDecodeError:
-                parsed_result = {"raw_result": result_text}
-
-            return {
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "result": parsed_result,
-            }
-
-        return {
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "error": {"code": -32601, "message": f"Method not found: {method}"},
-        }
-    except Exception as e:
-        logger.exception(f"Unexpected error in MCP JSON-RPC handler: {e}")
-        return {
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "error": {"code": -32603, "message": f"Internal server error: {str(e)}"},
-        }
-
-@app.post("/mcp/tool", response_model=ToolResponse)
-async def call_tool_api(request: ToolRequest):
-    """
-    MCP Tool hívás HTTP JSON-RPC protokollon
-    
-    Használat az n8n-ben:
-    POST http://fastmcp-server:8000/mcp/tool
-    
-    Body:
-    {
-        "name": "parse_html_and_extract_news",
-        "arguments": {
-            "html_content": "...",
-            "source_url": "https://example.com"
-        }
-    }
-    """
-    try:
-        # Validate request structure
-        name = request.name
-        arguments = request.arguments
-
-        logger.info(f"Processing tool call: {name}")
-        raw_result = await call_mcp_tool(name, arguments)
-        result = cast(Dict[str, Any], raw_result)
-        
-        # Szöveges konverzió ha szükséges
-        if result.get("isError", False):
-            error_text = "Unknown error"
-            content = result.get("content", [])
-            if content and len(content) > 0:
-                error_text = content[0].get("text", "Unknown error") if isinstance(content[0], dict) else str(content[0])
-            logger.error(f"Tool error: {error_text}")
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=error_text
-            )
-        
-        # Sikeres hívás
-        result_text = ""
-        content = result.get("content", [])
-        if content and len(content) > 0:
-            result_text = content[0].get("text", "") if isinstance(content[0], dict) else str(content[0])
-        
-        try:
-            result_json = json.loads(result_text)
-        except json.JSONDecodeError as e:
-            logger.warning(f"Could not parse result as JSON: {e}")
-            result_json = {"raw_result": result_text}
-        
-        return ToolResponse(status="success", result=result_json)
-    
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.exception(f"Unexpected error in call_tool_api: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Server error: {str(e)}"
-        )
 
 def run_server():
     """HTTP szerver indítása (szinkron)"""
