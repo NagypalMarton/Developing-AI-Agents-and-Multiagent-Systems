@@ -522,8 +522,9 @@ def detect_event_type(title: str) -> EventType:
 # ============================================================================
 
 mcp = FastMCP("news-to-social-agent")
+mcp.settings.streamable_http_path = "/sse"
 
-mcp_app = mcp.streamable_http_app(streamable_http_path="/sse", json_response=True, stateless_http=True)
+mcp_app = mcp.streamable_http_app()
 
 @mcp.tool()
 async def parse_html_and_extract_news(html_content: str, source_url: str) -> Dict[str, Any]:
