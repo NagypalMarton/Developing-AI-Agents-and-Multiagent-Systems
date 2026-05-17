@@ -146,7 +146,7 @@ def _extract_tmit_news(soup, source_url: str) -> List[Dict[str, Any]]:
             html_str = str(article)
             news = parse_tmit_news(html_str, source_url)
             if news:
-                news_items.append(news.model_dump())
+                news_items.append(news.model_dump(mode="json", exclude_none=True))
         logger.info(f"Found {len(tmit_articles)} TMIT articles")
     except (AttributeError, TypeError, ValueError) as e:
         logger.error(f"Error parsing TMIT articles: {e}")
@@ -164,7 +164,7 @@ def _extract_vik_news(soup, source_url: str) -> List[Dict[str, Any]]:
                 html_str = str(parent_div)
                 news = parse_vik_news(html_str, source_url)
                 if news:
-                    news_items.append(news.model_dump())
+                    news_items.append(news.model_dump(mode="json", exclude_none=True))
         logger.info(f"Found {len(vik_news)} VIK news items")
     except (AttributeError, TypeError, ValueError) as e:
         logger.error(f"Error parsing VIK news: {e}")
@@ -180,7 +180,7 @@ def _extract_bme_news(soup, source_url: str) -> List[Dict[str, Any]]:
             html_str = str(news_card)
             news = parse_bme_news(html_str, source_url)
             if news:
-                news_items.append(news.model_dump())
+                news_items.append(news.model_dump(mode="json", exclude_none=True))
         logger.info(f"Found {len(bme_news)} BME news cards")
     except (AttributeError, TypeError, ValueError) as e:
         logger.error(f"Error parsing BME news: {e}")
@@ -198,7 +198,7 @@ def _extract_bme_events(soup, source_url: str) -> List[Dict[str, Any]]:
                 html_str = str(parent)
                 event = parse_bme_event(html_str, source_url)
                 if event:
-                    events.append(event.model_dump())
+                    events.append(event.model_dump(mode="json", exclude_none=True))
         logger.info(f"Found {len(bme_events)} BME events")
     except (AttributeError, TypeError, ValueError) as e:
         logger.error(f"Error parsing BME events: {e}")
@@ -214,7 +214,7 @@ def _extract_simple_events(soup, source_url: str) -> List[Dict[str, Any]]:
             html_str = str(event_elem)
             event = parse_simple_event(html_str, source_url)
             if event:
-                events.append(event.model_dump())
+                events.append(event.model_dump(mode="json", exclude_none=True))
         logger.info(f"Found {len(simple_events)} simple events")
     except (AttributeError, TypeError, ValueError) as e:
         logger.error(f"Error parsing simple events: {e}")
