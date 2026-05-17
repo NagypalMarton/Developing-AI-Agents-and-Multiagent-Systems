@@ -12,7 +12,6 @@ from bs4 import BeautifulSoup
 from mcp.server import Server
 from mcp.types import Tool, TextContent
 from fastapi import FastAPI, Body, HTTPException, status
-from fastapi.responses import StreamingResponse
 import uvicorn
 
 # Configure logging
@@ -35,6 +34,43 @@ DISCORD_DEFAULT_COLOR = 3447003
 HTML_PARSER_CONFIG = {
     "features": "html.parser",
     "from_encoding": "utf-8"
+}
+
+# HTML Selectors configuration - centralized for easy maintenance
+HTML_SELECTORS = {
+    "tmit": {
+        "article": {"tag": "article", "class": "node-hir"},
+        "title": {"tag": "h2", "class": "node-title"},
+        "content": {"tag": "div", "attrs": {"property": "content:encoded"}},
+        "image": {"tag": "img"}
+    },
+    "vik": {
+        "title": {"tag": "h2", "class": "news-title-important"},
+        "date": {"tag": "span", "class": "news-date"},
+        "excerpt": {"tag": "div", "class": "news-excerpt"},
+        "image": {"tag": "img", "class": "news-image"},
+        "parent": {"tag": "div", "class": "news-item"}
+    },
+    "bme_news": {
+        "card": {"tag": "div", "class": "bme_news_card"},
+        "title": {"tag": "h4", "class": "bme_news_card-title"},
+        "date": {"tag": "span", "class": "field--name-created"},
+        "body": {"tag": "div", "class": "bme_news_card-body"},
+        "image": {"tag": "img"}
+    },
+    "bme_event": {
+        "title": {"tag": "h4", "class": "bme_event_card-title"},
+        "date_container": {"tag": "div", "class": "bme_event_card-date"},
+        "date": {"tag": "span", "class": "nowrap"},
+        "location": {"tag": "p", "class": "bme_event_card-location"},
+        "body": {"tag": "div", "class": "bme_event_card-body"},
+        "parent": {"tag": "div", "class": "px-5"}
+    },
+    "simple_event": {
+        "date": {"tag": "span", "class": "event-date"},
+        "title": {"tag": "a", "class": "event-title"},
+        "container": {"tag": "div", "class": "event"}
+    }
 }
 
 # Supported HTML parser types
@@ -207,16 +243,17 @@ def parse_tmit_news(html_content: str, source_url: str) -> Optional[NewsItem]:
     """TMIT (node-hir) típusú hír parsése"""
     try:
         soup = BeautifulSoup(html_content, **HTML_PARSER_CONFIG)
-        article = soup.find('article', class_='node-hir')
+        sel = HTML_SELECTORS["tmit"]
         
+        article = soup.find(sel["article"]["tag"], class_=sel["article"]["class"])
         if not article:
             logger.debug("TMIT article not found")
             return None
         
-        title = safe_find_text(article, 'h2', class_='node-title') or "N/A"
-        image_elem = article.find('img')
+        title = safe_find_text(article, sel["title"]["tag"], class_=sel["title"]["class"]) or "N/A"
+        image_elem = article.find(sel["image"]["tag"])
         image_url = validate_url_safety(safe_get_attr(image_elem, 'src'))
-        content = safe_find_text(article, 'div', attrs={'property': 'content:encoded'}) or ""
+        content = safe_find_text(article, sel["content"]["tag"], attrs=sel["content"]["attrs"]) or ""
         
         return NewsItem(
             title=title,
@@ -232,16 +269,17 @@ def parse_vik_news(html_content: str, source_url: str) -> Optional[NewsItem]:
     """VIK (news-title-important) típusú hír parsése"""
     try:
         soup = BeautifulSoup(html_content, **HTML_PARSER_CONFIG)
-        title_elem = soup.find('h2', class_='news-title-important')
+        sel = HTML_SELECTORS["vik"]
         
+        title_elem = soup.find(sel["title"]["tag"], class_=sel["title"]["class"])
         if not title_elem:
             logger.debug("VIK title not found")
             return None
         
         title = title_elem.get_text(strip=True) or "N/A"
-        publish_date = safe_find_text(soup, 'span', class_='news-date')
-        content = safe_find_text(soup, 'div', class_='news-excerpt') or ""
-        image_elem = soup.find('img', class_='news-image')
+        publish_date = safe_find_text(soup, sel["date"]["tag"], class_=sel["date"]["class"])
+        content = safe_find_text(soup, sel["excerpt"]["tag"], class_=sel["excerpt"]["class"]) or ""
+        image_elem = soup.find(sel["image"]["tag"], class_=sel["image"]["class"])
         image_url = validate_url_safety(safe_get_attr(image_elem, 'src'))
         
         return NewsItem(
@@ -259,16 +297,17 @@ def parse_bme_news(html_content: str, source_url: str) -> Optional[NewsItem]:
     """BME (bme_news_card) típusú hír parsése"""
     try:
         soup = BeautifulSoup(html_content, **HTML_PARSER_CONFIG)
-        news_card = soup.find('div', class_='bme_news_card')
+        sel = HTML_SELECTORS["bme_news"]
         
+        news_card = soup.find(sel["card"]["tag"], class_=sel["card"]["class"])
         if not news_card:
             logger.debug("BME news card not found")
             return None
         
-        title = safe_find_text(news_card, 'h4', class_='bme_news_card-title') or "N/A"
-        publish_date = safe_find_text(news_card, 'span', class_='field--name-created')
-        content = safe_find_text(news_card, 'div', class_='bme_news_card-body') or ""
-        image_elem = news_card.find('img')
+        title = safe_find_text(news_card, sel["title"]["tag"], class_=sel["title"]["class"]) or "N/A"
+        publish_date = safe_find_text(news_card, sel["date"]["tag"], class_=sel["date"]["class"])
+        content = safe_find_text(news_card, sel["body"]["tag"], class_=sel["body"]["class"]) or ""
+        image_elem = news_card.find(sel["image"]["tag"])
         image_url = validate_url_safety(safe_get_attr(image_elem, 'src'))
         
         return NewsItem(
@@ -286,12 +325,13 @@ def parse_bme_event(html_content: str, source_url: str) -> Optional[EventDetecte
     """BME event card parsése"""
     try:
         soup = BeautifulSoup(html_content, **HTML_PARSER_CONFIG)
+        sel = HTML_SELECTORS["bme_event"]
         
-        title = safe_find_text(soup, 'h4', class_='bme_event_card-title') or "N/A"
-        date_elem = soup.find('div', class_='bme_event_card-date')
-        date_str = safe_find_text(date_elem, 'span', class_='nowrap') or ""
-        location = safe_find_text(soup, 'p', class_='bme_event_card-location')
-        description = safe_find_text(soup, 'div', class_='bme_event_card-body') or ""
+        title = safe_find_text(soup, sel["title"]["tag"], class_=sel["title"]["class"]) or "N/A"
+        date_elem = soup.find(sel["date_container"]["tag"], class_=sel["date_container"]["class"])
+        date_str = safe_find_text(date_elem, sel["date"]["tag"], class_=sel["date"]["class"]) or ""
+        location = safe_find_text(soup, sel["location"]["tag"], class_=sel["location"]["class"])
+        description = safe_find_text(soup, sel["body"]["tag"], class_=sel["body"]["class"]) or ""
         
         event_type = detect_event_type(title)
         
@@ -311,8 +351,10 @@ def parse_simple_event(html_content: str, source_url: str) -> Optional[EventDete
     """Egyszerű event formátum parsése (VIK)"""
     try:
         soup = BeautifulSoup(html_content, **HTML_PARSER_CONFIG)
-        date_str = safe_find_text(soup, 'span', class_='event-date') or ""
-        title = safe_find_text(soup, 'a', class_='event-title') or "N/A"
+        sel = HTML_SELECTORS["simple_event"]
+        
+        date_str = safe_find_text(soup, sel["date"]["tag"], class_=sel["date"]["class"]) or ""
+        title = safe_find_text(soup, sel["title"]["tag"], class_=sel["title"]["class"]) or "N/A"
         
         return EventDetected(
             title=title,
@@ -580,7 +622,8 @@ async def parse_html_and_extract_news(html_content: str, source_url: str) -> Dic
         
         # TMIT hírek
         try:
-            tmit_articles = soup.find_all('article', class_='node-hir')
+            sel = HTML_SELECTORS["tmit"]
+            tmit_articles = soup.find_all(sel["article"]["tag"], class_=sel["article"]["class"])
             for article in tmit_articles:
                 html_str = str(article)
                 news = parse_tmit_news(html_str, source_url)
@@ -592,9 +635,10 @@ async def parse_html_and_extract_news(html_content: str, source_url: str) -> Dic
         
         # VIK hírek
         try:
-            vik_news = soup.find_all('h2', class_='news-title-important')
+            sel = HTML_SELECTORS["vik"]
+            vik_news = soup.find_all(sel["title"]["tag"], class_=sel["title"]["class"])
             for news_elem in vik_news:
-                parent_div = news_elem.find_parent('div', class_='news-item')
+                parent_div = news_elem.find_parent(sel["parent"]["tag"], class_=sel["parent"]["class"])
                 if parent_div:
                     html_str = str(parent_div)
                     news = parse_vik_news(html_str, source_url)
@@ -606,7 +650,8 @@ async def parse_html_and_extract_news(html_content: str, source_url: str) -> Dic
         
         # BME hírek
         try:
-            bme_news = soup.find_all('div', class_='bme_news_card')
+            sel = HTML_SELECTORS["bme_news"]
+            bme_news = soup.find_all(sel["card"]["tag"], class_=sel["card"]["class"])
             for news_card in bme_news:
                 html_str = str(news_card)
                 news = parse_bme_news(html_str, source_url)
@@ -618,9 +663,10 @@ async def parse_html_and_extract_news(html_content: str, source_url: str) -> Dic
         
         # BME események
         try:
-            bme_events = soup.find_all('div', class_='bme_event_card-date')
+            sel = HTML_SELECTORS["bme_event"]
+            bme_events = soup.find_all(sel["date_container"]["tag"], class_=sel["date_container"]["class"])
             for event_card in bme_events:
-                parent = event_card.find_parent('div', class_='px-5')
+                parent = event_card.find_parent(sel["parent"]["tag"], class_=sel["parent"]["class"])
                 if parent:
                     html_str = str(parent)
                     event = parse_bme_event(html_str, source_url)
@@ -632,7 +678,8 @@ async def parse_html_and_extract_news(html_content: str, source_url: str) -> Dic
         
         # Egyszerű események
         try:
-            simple_events = soup.find_all('div', class_='event')
+            sel = HTML_SELECTORS["simple_event"]
+            simple_events = soup.find_all(sel["container"]["tag"], class_=sel["container"]["class"])
             for event_elem in simple_events:
                 html_str = str(event_elem)
                 event = parse_simple_event(html_str, source_url)
