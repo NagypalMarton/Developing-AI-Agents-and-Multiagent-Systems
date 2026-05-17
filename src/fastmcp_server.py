@@ -2,7 +2,7 @@
 import re
 import logging
 from datetime import datetime
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Callable
 from enum import Enum
 from urllib.parse import urlparse
 from contextlib import asynccontextmanager
@@ -93,6 +93,14 @@ class PlatformType(str, Enum):
     INSTAGRAM = "instagram"
     DISCORD = "discord"
 
+class SocialMediaPosts(BaseModel):
+    """Social media posts for all platforms"""
+    facebook: Optional[str] = None
+    linkedin: Optional[str] = None
+    x: Optional[str] = None
+    instagram: Optional[str] = None
+    discord: Optional[str] = None
+
 class HTMLParseRequest(BaseModel):
     """Validated HTML parsing request"""
     html_content: str = Field(..., min_length=1, description="HTML tartalom")
@@ -106,15 +114,25 @@ class HTMLParseRequest(BaseModel):
             raise ValueError("HTML tartalom nem lehet üres")
         return v
 
+class ParseHTMLResponse(BaseModel):
+    """Response model for parse_html_and_extract_news"""
+    news_count: int
+    event_count: int
+    news_items: List[Dict[str, Any]]
+    events_items: List[Dict[str, Any]]
+    status: str
+    error: Optional[str] = None
+
 class EventDetected(BaseModel):
     """Detektált esemény"""
     title: str = Field(..., description="Esemény címe")
     date: str = Field(..., description="Esemény dátuma (YYYY.MMM.DD. formátumban)")
     location: Optional[str] = Field(None, description="Esemény helyszíne")
     event_type: EventType = Field(default=EventType.OTHER)
-    description: str = Field(..., description="Esemény leírása")
+    content: str = Field(..., description="Esemény tartalma/leírása")
     registration_url: Optional[str] = Field(None, description="Regisztrációs URL")
     source_url: Optional[str] = Field(None, description="Forrás URL")
+    social_posts: Optional[SocialMediaPosts] = Field(None, description="Social media posztok")
 
 class NewsItem(BaseModel):
     """Kinyert hírelemek"""
@@ -124,6 +142,7 @@ class NewsItem(BaseModel):
     source_url: str
     publish_date: Optional[str] = None
     events: List[EventDetected] = Field(default_factory=list)
+    social_posts: Optional[SocialMediaPosts] = Field(None, description="Social media posztok")
 
 # NOTE: Social post models (SocialPostFacebook, etc.) are generated dynamically as dicts
 # in generate_social_posts() function. Legacy Pydantic models removed (code smell #3).
@@ -132,59 +151,58 @@ class NewsItem(BaseModel):
 # HELPER FUNCTIONS - Common parsing utilities
 # ============================================================================
 
+def create_error_response(status: str, error: str, news_items: Optional[List] = None, events: Optional[List] = None) -> Dict[str, Any]:
+    """Create standardized error response"""
+    return {
+        "status": status,
+        "error": error,
+        "news_items": news_items or [],
+        "events_items": events or [],
+        "news_count": 0,
+        "event_count": 0
+    }
+
+def create_success_response(news_items: List, events: List) -> Dict[str, Any]:
+    """Create standardized success response"""
+    return {
+        "status": "success",
+        "news_items": news_items,
+        "events_items": events,
+        "news_count": len(news_items),
+        "event_count": len(events)
+    }
+
 # ============================================================================
 # EXTRACTION HELPERS - Code smell #4 refactoring
 # ============================================================================
 
-def _extract_tmit_news(soup, source_url: str) -> List[Dict[str, Any]]:
-    """Extract TMIT news articles from soup"""
+def safe_extract_news(soup, source_url: str, extract_func: Callable, selector_key: str, log_name: str) -> List[Dict[str, Any]]:
+    """Safe extraction wrapper with error handling and logging"""
     news_items = []
     try:
-        sel = HTML_SELECTORS["tmit"]
-        tmit_articles = soup.find_all(sel["article"]["tag"], class_=sel["article"]["class"])
-        for article in tmit_articles:
-            html_str = str(article)
-            news = parse_tmit_news(html_str, source_url)
+        sel = HTML_SELECTORS[selector_key]
+        items = soup.find_all(sel["parent"]["tag"], class_=sel["parent"]["class"]) if "parent" in sel else soup.find_all(sel["card"]["tag"], class_=sel["card"]["class"])
+        for item in items:
+            html_str = str(item)
+            news = extract_func(html_str, source_url)
             if news:
                 news_items.append(news.model_dump(mode="json", exclude_none=False))
-        logger.info(f"Found {len(tmit_articles)} TMIT articles")
+        logger.info(f"Found {len(items)} {log_name}")
     except (AttributeError, TypeError, ValueError) as e:
-        logger.error(f"Error parsing TMIT articles: {e}")
+        logger.error(f"Error parsing {log_name}: {e}")
     return news_items
+
+def _extract_tmit_news(soup, source_url: str) -> List[Dict[str, Any]]:
+    """Extract TMIT news articles from soup"""
+    return safe_extract_news(soup, source_url, parse_tmit_news, "tmit", "TMIT articles")
 
 def _extract_vik_news(soup, source_url: str) -> List[Dict[str, Any]]:
     """Extract VIK news from soup"""
-    news_items = []
-    try:
-        sel = HTML_SELECTORS["vik"]
-        vik_news = soup.find_all(sel["title"]["tag"], class_=sel["title"]["class"])
-        for news_elem in vik_news:
-            parent_div = news_elem.find_parent(sel["parent"]["tag"], class_=sel["parent"]["class"])
-            if parent_div:
-                html_str = str(parent_div)
-                news = parse_vik_news(html_str, source_url)
-                if news:
-                    news_items.append(news.model_dump(mode="json", exclude_none=False))
-        logger.info(f"Found {len(vik_news)} VIK news items")
-    except (AttributeError, TypeError, ValueError) as e:
-        logger.error(f"Error parsing VIK news: {e}")
-    return news_items
+    return safe_extract_news(soup, source_url, parse_vik_news, "vik", "VIK news items")
 
 def _extract_bme_news(soup, source_url: str) -> List[Dict[str, Any]]:
     """Extract BME news cards from soup"""
-    news_items = []
-    try:
-        sel = HTML_SELECTORS["bme_news"]
-        bme_news = soup.find_all(sel["card"]["tag"], class_=sel["card"]["class"])
-        for news_card in bme_news:
-            html_str = str(news_card)
-            news = parse_bme_news(html_str, source_url)
-            if news:
-                news_items.append(news.model_dump(mode="json", exclude_none=False))
-        logger.info(f"Found {len(bme_news)} BME news cards")
-    except (AttributeError, TypeError, ValueError) as e:
-        logger.error(f"Error parsing BME news: {e}")
-    return news_items
+    return safe_extract_news(soup, source_url, parse_bme_news, "bme_news", "BME news cards")
 
 def _extract_bme_events(soup, source_url: str) -> List[Dict[str, Any]]:
     """Extract BME events from soup"""
@@ -351,7 +369,8 @@ def parse_tmit_news(html_content: str, source_url: str) -> Optional[NewsItem]:
             title=title,
             content=content,
             image_url=image_url,
-            source_url=str(source_url)
+            source_url=str(source_url),
+            social_posts=None
         )
     except (AttributeError, TypeError, ValueError) as e:
         logger.error(f"Error parsing TMIT news: {e}")
@@ -379,7 +398,8 @@ def parse_vik_news(html_content: str, source_url: str) -> Optional[NewsItem]:
             content=content,
             image_url=image_url,
             source_url=str(source_url),
-            publish_date=publish_date
+            publish_date=publish_date,
+            social_posts=None
         )
     except (AttributeError, TypeError, ValueError) as e:
         logger.error(f"Error parsing VIK news: {e}")
@@ -407,7 +427,8 @@ def parse_bme_news(html_content: str, source_url: str) -> Optional[NewsItem]:
             content=content,
             image_url=image_url,
             source_url=str(source_url),
-            publish_date=publish_date
+            publish_date=publish_date,
+            social_posts=None
         )
     except (AttributeError, TypeError, ValueError) as e:
         logger.error(f"Error parsing BME news: {e}")
@@ -423,7 +444,7 @@ def parse_bme_event(html_content: str, source_url: str) -> Optional[EventDetecte
         date_elem = soup.find(sel["date_container"]["tag"], class_=sel["date_container"]["class"])
         date_str = safe_find_text(date_elem, sel["date"]["tag"], class_=sel["date"]["class"]) or ""
         location = safe_find_text(soup, sel["location"]["tag"], class_=sel["location"]["class"])
-        description = safe_find_text(soup, sel["body"]["tag"], class_=sel["body"]["class"]) or ""
+        content = safe_find_text(soup, sel["body"]["tag"], class_=sel["body"]["class"]) or ""
         
         event_type = detect_event_type(title)
         
@@ -432,9 +453,10 @@ def parse_bme_event(html_content: str, source_url: str) -> Optional[EventDetecte
             date=parse_date_string(date_str),
             location=location,
             event_type=event_type,
-            description=description,
+            content=content,
             registration_url=None,
-            source_url=str(source_url)
+            source_url=str(source_url),
+            social_posts=None
         )
     except (AttributeError, TypeError, ValueError) as e:
         logger.error(f"Error parsing BME event: {e}")
@@ -454,9 +476,10 @@ def parse_simple_event(html_content: str, source_url: str) -> Optional[EventDete
             date=parse_date_string(date_str),
             location=None,
             event_type=EventType.OTHER,
-            description="",
+            content="",
             registration_url=None,
-            source_url=str(source_url)
+            source_url=str(source_url),
+            social_posts=None
         )
     except (AttributeError, TypeError, ValueError) as e:
         logger.error(f"Error parsing simple event: {e}")
@@ -565,7 +588,7 @@ async def parse_html_and_extract_news(html_content: str, source_url: str) -> Dic
                 "news_count": 0,
                 "event_count": 0,
                 "news_items": [],
-                "events": [],
+                "events_items": [],
                 "status": "error",
                 "error": "HTML tartalom nem lehet üres"
             }
@@ -576,7 +599,7 @@ async def parse_html_and_extract_news(html_content: str, source_url: str) -> Dic
                 "news_count": 0,
                 "event_count": 0,
                 "news_items": [],
-                "events": [],
+                "events_items": [],
                 "status": "error",
                 "error": "Source URL szükséges"
             }
@@ -599,7 +622,7 @@ async def parse_html_and_extract_news(html_content: str, source_url: str) -> Dic
             "news_count": len(news_items),
             "event_count": len(events),
             "news_items": news_items,
-            "events": events,
+            "events_items": events,
             "status": "success"
         }
     
@@ -609,7 +632,7 @@ async def parse_html_and_extract_news(html_content: str, source_url: str) -> Dic
             "status": "error",
             "error": f"Validation error: {str(e)}",
             "news_items": [],
-            "events": [],
+            "events_items": [],
             "news_count": 0,
             "event_count": 0
         }
@@ -619,7 +642,7 @@ async def parse_html_and_extract_news(html_content: str, source_url: str) -> Dic
             "status": "error",
             "error": f"Unexpected error: {str(e)}",
             "news_items": [],
-            "events": [],
+            "events_items": [],
             "news_count": 0,
             "event_count": 0
         }
