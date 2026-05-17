@@ -1045,6 +1045,8 @@ async def root():
         "auth_required": False,
         "api_docs": "http://fastmcp-server:8000/docs"
     }
+
+@app.get("/mcp/tools")
 async def list_tools_api():
     """Elérhető MCP toolok listája"""
     logger.info("Tool list requested")
