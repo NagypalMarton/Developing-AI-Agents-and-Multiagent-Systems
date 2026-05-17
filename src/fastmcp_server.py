@@ -3,7 +3,7 @@ import json
 import re
 import logging
 from datetime import datetime
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, cast
 from enum import Enum
 from urllib.parse import urlparse
 from contextlib import asynccontextmanager
@@ -275,7 +275,7 @@ REGEX_LOCATION = re.compile(r'(?:helyszín|location|hely)[\s:]*([^,.\n]+)', re.I
 def parse_tmit_news(html_content: str, source_url: str) -> Optional[NewsItem]:
     """TMIT (node-hir) típusú hír parsése"""
     try:
-        soup = BeautifulSoup(html_content, **HTML_PARSER_CONFIG)
+        soup = BeautifulSoup(html_content, features="html.parser", from_encoding="utf-8")
         sel = HTML_SELECTORS["tmit"]
         
         article = soup.find(sel["article"]["tag"], class_=sel["article"]["class"])
@@ -301,7 +301,7 @@ def parse_tmit_news(html_content: str, source_url: str) -> Optional[NewsItem]:
 def parse_vik_news(html_content: str, source_url: str) -> Optional[NewsItem]:
     """VIK (news-title-important) típusú hír parsése"""
     try:
-        soup = BeautifulSoup(html_content, **HTML_PARSER_CONFIG)
+        soup = BeautifulSoup(html_content, features="html.parser", from_encoding="utf-8")
         sel = HTML_SELECTORS["vik"]
         
         title_elem = soup.find(sel["title"]["tag"], class_=sel["title"]["class"])
@@ -329,7 +329,7 @@ def parse_vik_news(html_content: str, source_url: str) -> Optional[NewsItem]:
 def parse_bme_news(html_content: str, source_url: str) -> Optional[NewsItem]:
     """BME (bme_news_card) típusú hír parsése"""
     try:
-        soup = BeautifulSoup(html_content, **HTML_PARSER_CONFIG)
+        soup = BeautifulSoup(html_content, features="html.parser", from_encoding="utf-8")
         sel = HTML_SELECTORS["bme_news"]
         
         news_card = soup.find(sel["card"]["tag"], class_=sel["card"]["class"])
@@ -357,7 +357,7 @@ def parse_bme_news(html_content: str, source_url: str) -> Optional[NewsItem]:
 def parse_bme_event(html_content: str, source_url: str) -> Optional[EventDetected]:
     """BME event card parsése"""
     try:
-        soup = BeautifulSoup(html_content, **HTML_PARSER_CONFIG)
+        soup = BeautifulSoup(html_content, features="html.parser", from_encoding="utf-8")
         sel = HTML_SELECTORS["bme_event"]
         
         title = safe_find_text(soup, sel["title"]["tag"], class_=sel["title"]["class"]) or "N/A"
@@ -374,6 +374,7 @@ def parse_bme_event(html_content: str, source_url: str) -> Optional[EventDetecte
             location=location,
             event_type=event_type,
             description=description,
+            registration_url=None,
             source_url=str(source_url)
         )
     except (AttributeError, TypeError, ValueError) as e:
@@ -383,7 +384,7 @@ def parse_bme_event(html_content: str, source_url: str) -> Optional[EventDetecte
 def parse_simple_event(html_content: str, source_url: str) -> Optional[EventDetected]:
     """Egyszerű event formátum parsése (VIK)"""
     try:
-        soup = BeautifulSoup(html_content, **HTML_PARSER_CONFIG)
+        soup = BeautifulSoup(html_content, features="html.parser", from_encoding="utf-8")
         sel = HTML_SELECTORS["simple_event"]
         
         date_str = safe_find_text(soup, sel["date"]["tag"], class_=sel["date"]["class"]) or ""
@@ -392,8 +393,10 @@ def parse_simple_event(html_content: str, source_url: str) -> Optional[EventDete
         return EventDetected(
             title=title,
             date=parse_date_string(date_str),
+            location=None,
             event_type=EventType.OTHER,
             description="",
+            registration_url=None,
             source_url=str(source_url)
         )
     except (AttributeError, TypeError, ValueError) as e:
@@ -463,9 +466,8 @@ def detect_event_type(title: str) -> EventType:
 
 server = Server("news-to-social-agent")
 
-@server.list_tools()
-async def list_mcp_tools() -> list[Tool]:
-    """List available MCP tools"""
+def _build_tools() -> list[Tool]:
+    """Create MCP tool definitions for both MCP and HTTP APIs."""
     return [
         Tool(
             name="parse_html_and_extract_news",
@@ -521,6 +523,11 @@ async def list_mcp_tools() -> list[Tool]:
         )
     ]
 
+@server.list_tools()
+async def list_mcp_tools() -> list[Tool]:
+    """List available MCP tools"""
+    return _build_tools()
+
 @server.call_tool()
 async def call_mcp_tool(name: str, arguments: dict) -> dict:
     """
@@ -555,15 +562,17 @@ async def call_mcp_tool(name: str, arguments: dict) -> dict:
             elif name == "detect_events_from_content":
                 result = await detect_events_from_content(
                     arguments.get("content", ""),
-                    arguments.get("current_date")
+                    arguments.get("current_date") if isinstance(arguments.get("current_date"), str) else None
                 )
             elif name == "generate_social_posts":
+                events = arguments.get("events")
+                platforms = arguments.get("platforms")
                 result = await generate_social_posts(
                     arguments.get("news_title", ""),
                     arguments.get("news_content", ""),
                     arguments.get("source_url", ""),
-                    arguments.get("events"),
-                    arguments.get("platforms")
+                    events if isinstance(events, list) else None,
+                    platforms if isinstance(platforms, list) else None
                 )
             elif name == "enrich_with_registration_link":
                 result = await enrich_with_registration_link(
@@ -645,7 +654,7 @@ async def parse_html_and_extract_news(html_content: str, source_url: str) -> Dic
                 "error": "Source URL szükséges"
             }
         
-        soup = BeautifulSoup(html_content, **HTML_PARSER_CONFIG)
+        soup = BeautifulSoup(html_content, features="html.parser", from_encoding="utf-8")
         
         # Extract news and events using helper functions
         tmit_news = _extract_tmit_news(soup, source_url)
@@ -688,7 +697,7 @@ async def parse_html_and_extract_news(html_content: str, source_url: str) -> Dic
             "event_count": 0
         }
 
-async def detect_events_from_content(content: str, current_date: str = None) -> Dict[str, Any]:
+async def detect_events_from_content(content: str, current_date: Optional[str] = None) -> Dict[str, Any]:
     """
     LLM segítségével részletesebb eseményadatok detektálása szövegből.
     
@@ -752,8 +761,8 @@ async def generate_social_posts(
     news_title: str,
     news_content: str,
     source_url: str,
-    events: List[Dict[str, Any]] = None,
-    platforms: List[str] = None
+    events: Optional[List[Dict[str, Any]]] = None,
+    platforms: Optional[List[str]] = None
 ) -> Dict[str, Any]:
     """
     Platform-specifikus szociálmédiai posztok generálása.
@@ -781,8 +790,8 @@ async def generate_social_posts(
             raise ValueError("source_url must be non-empty string")
         
         # Validate URL
-        source_url = validate_url_safety(source_url)
-        if not source_url:
+        validated_source_url = validate_url_safety(source_url)
+        if not validated_source_url:
             logger.warning("Source URL failed validation")
             raise ValueError("Invalid source URL")
         
@@ -808,7 +817,7 @@ Kedves közösség! 🎓
 
 {news_content}
 
-Tudj meg többet: {source_url}
+Tudj meg többet: {validated_source_url}
 """,
             "linkedin": f"""
 {news_title}
@@ -816,16 +825,16 @@ Tudj meg többet: {source_url}
 {news_content}
 
 📌 Tudj meg többet:
-{source_url}
+{validated_source_url}
 
 #BME #Hírek #Oktatás
 """,
-            "x": f"{news_title}\n\n{news_content[:200]}...\n\n{source_url}",
+            "x": f"{news_title}\n\n{news_content[:200]}...\n\n{validated_source_url}",
             "instagram": f"{news_title}\n.\n{news_content}\n\n#BME #Egyetem #Hírek",
             "discord": {
                 "title": news_title,
                 "description": news_content,
-                "url": source_url
+                "url": validated_source_url
             }
         }
         
@@ -846,7 +855,7 @@ Tudj meg többet: {source_url}
                     "body": templates["linkedin"],
                     "hashtags": ["BME", "Hírek", "Oktatás"],
                     "cta_text": "Regisztrálj",
-                    "cta_url": events[0].get("registration_url") if events else source_url
+                    "cta_url": events[0].get("registration_url") if events else validated_source_url
                 }
             
             if "x" in platforms:
@@ -867,7 +876,7 @@ Tudj meg többet: {source_url}
                     "embed_title": news_title[:DISCORD_TITLE_MAX],
                     "embed_description": news_content[:DISCORD_DESCRIPTION_MAX],
                     "embed_fields": {
-                        "Forrás": source_url,
+                        "Forrás": validated_source_url,
                         "Típus": "Hír"
                     },
                     "embed_color": DISCORD_DEFAULT_COLOR
@@ -1071,7 +1080,7 @@ async def root():
 async def list_tools_api():
     """Elérhető MCP toolok listája"""
     logger.info("Tool list requested")
-    tools = await list_mcp_tools()
+    tools = _build_tools()
     return {
         "tools": [
             {
@@ -1093,7 +1102,7 @@ async def mcp_jsonrpc_handler(raw_request: dict = Body(...)):
 
     try:
         if method == "tools/list":
-            tools = await list_mcp_tools()
+            tools = _build_tools()
             return {
                 "jsonrpc": "2.0",
                 "id": request_id,
@@ -1120,7 +1129,8 @@ async def mcp_jsonrpc_handler(raw_request: dict = Body(...)):
                     "error": {"code": -32602, "message": "Missing required parameter: name"},
                 }
 
-            result = await call_mcp_tool(tool_name, tool_args)
+            raw_result = await call_mcp_tool(tool_name, tool_args)
+            result = cast(Dict[str, Any], raw_result)
             if result.get("isError", False):
                 content = result.get("content", [])
                 error_text = content[0].get("text", "Unknown error") if content else "Unknown error"
@@ -1179,7 +1189,8 @@ async def call_tool_api(request: ToolRequest):
         arguments = request.arguments
 
         logger.info(f"Processing tool call: {name}")
-        result = await call_mcp_tool(name, arguments)
+        raw_result = await call_mcp_tool(name, arguments)
+        result = cast(Dict[str, Any], raw_result)
         
         # Szöveges konverzió ha szükséges
         if result.get("isError", False):
