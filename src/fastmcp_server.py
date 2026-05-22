@@ -7,7 +7,7 @@ from enum import Enum
 from urllib.parse import urlparse
 from contextlib import asynccontextmanager
 from pydantic import BaseModel, Field, field_validator, HttpUrl
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from fastapi import FastAPI
@@ -68,7 +68,22 @@ HTML_SELECTORS = {
     "simple_event": {
         "date": {"tag": "span", "class": "event-date"},
         "title": {"tag": "a", "class": "event-title"},
-        "container": {"tag": "div", "class": "event"}
+        "container": {"tag": "div", "class": "event"},
+        "registration": {"tag": "a", "class": "registration-link"},
+        "participants": {"tag": "p", "class": "event-participants"}
+    }
+}
+
+# Social templates (use format placeholders: {title}, {content}, {url})
+SOCIAL_TEMPLATES = {
+    "facebook": "Kedves közösség! 🎓\n\n{title}\n\n{content}\n\nTudj meg többet: {url}\n",
+    "linkedin": "{title}\n\n{content}\n\n📌 Tudj meg többet:\n{url}\n\n#BME #Hírek #Oktatás\n",
+    "x": "{title}\n\n{content_slice}...\n\n{url}",
+    "instagram": "{title}\n.\n{content}\n\n#BME #Egyetem #Hírek",
+    "discord": {
+        "title": "{title}",
+        "description": "{content}",
+        "url": "{url}"
     }
 }
 
@@ -124,15 +139,16 @@ class ParseHTMLResponse(BaseModel):
     error: Optional[str] = None
 
 class EventDetected(BaseModel):
-    """Detektált esemény"""
+    """Detektált esemény - minden mező kötelező"""
     title: str = Field(..., description="Esemény címe")
     date: str = Field(..., description="Esemény dátuma (YYYY.MMM.DD. formátumban)")
-    location: Optional[str] = Field(None, description="Esemény helyszíne")
-    event_type: EventType = Field(default=EventType.OTHER)
+    location: str = Field(..., description="Esemény helyszíne")
+    event_type: EventType = Field(..., description="Esemény típusa")
     content: str = Field(..., description="Esemény tartalma/leírása")
-    registration_url: Optional[str] = Field(None, description="Regisztrációs URL")
-    source_url: Optional[str] = Field(None, description="Forrás URL")
-    social_posts: Optional[SocialMediaPosts] = Field(None, description="Social media posztok")
+    registration_url: str = Field(..., description="Regisztrációs URL")
+    source_url: str = Field(..., description="Forrás URL")
+    social_posts: SocialMediaPosts = Field(..., description="Social media posztok")
+    participants: List[str] = Field(..., description="Résztvevők listája")
 
 class NewsItem(BaseModel):
     """Kinyert hírelemek"""
@@ -185,7 +201,8 @@ def safe_extract_news(soup, source_url: str, extract_func: Callable, selector_ke
         if not container_selector:
             raise KeyError(f"No container selector configured for {selector_key}")
 
-        items = soup.find_all(container_selector["tag"], class_=container_selector["class"])
+        class_name = container_selector.get("class") or ""
+        items = soup.select(f"{container_selector['tag']}.{class_name}") if class_name else soup.select(container_selector['tag'])
         for item in items:
             html_str = str(item)
             news = extract_func(html_str, source_url)
@@ -213,9 +230,15 @@ def _extract_bme_events(soup, source_url: str) -> List[Dict[str, Any]]:
     events = []
     try:
         sel = HTML_SELECTORS["bme_event"]
-        bme_events = soup.find_all(sel["date_container"]["tag"], class_=sel["date_container"]["class"])
+        dc = sel["date_container"]
+        dc_class = dc.get("class") or ""
+        bme_events = soup.select(f"{dc['tag']}.{dc_class}") if dc_class else soup.select(dc['tag'])
         for event_card in bme_events:
-            parent = event_card.find_parent(sel["parent"]["tag"], class_=sel["parent"]["class"])
+            parent = event_card.find_parent(sel["parent"]["tag"]) if sel.get("parent") else None
+            if parent and sel.get("parent"):
+                parent_classes = parent.get("class", [])
+                if sel["parent"].get("class") not in parent_classes:
+                    parent = None
             if parent:
                 html_str = str(parent)
                 event = parse_bme_event(html_str, source_url)
@@ -231,7 +254,9 @@ def _extract_simple_events(soup, source_url: str) -> List[Dict[str, Any]]:
     events = []
     try:
         sel = HTML_SELECTORS["simple_event"]
-        simple_events = soup.find_all(sel["container"]["tag"], class_=sel["container"]["class"])
+        c = sel["container"]
+        c_class = c.get("class") or ""
+        simple_events = soup.select(f"{c['tag']}.{c_class}") if c_class else soup.select(c['tag'])
         for event_elem in simple_events:
             html_str = str(event_elem)
             event = parse_simple_event(html_str, source_url)
@@ -246,12 +271,20 @@ def _extract_simple_events(soup, source_url: str) -> List[Dict[str, Any]]:
 # PARSING HELPER FUNCTIONS
 # ============================================================================
 
-def safe_find_text(element, *args, **kwargs) -> Optional[str]:
-    """Safely extract and strip text from BeautifulSoup element"""
+def safe_find_text(element, tag: str, class_name: Optional[str] = None, attrs: Optional[Dict[str, str]] = None) -> Optional[str]:
+    """Safely extract and strip text from BeautifulSoup element using CSS selectors."""
     if element is None:
         return None
     try:
-        found = element.find(*args, **kwargs)
+        selector = tag
+        if class_name:
+            selector = f"{tag}.{class_name}"
+        elif attrs:
+            # build attribute selector for the first attr
+            parts = [f'[{k}="{v}"]' for k, v in attrs.items()]
+            selector = tag + ''.join(parts)
+
+        found = element.select_one(selector)
         if found:
             text = found.get_text(strip=True)
             return text if text else None
@@ -337,6 +370,11 @@ def _format_human_date(date_value: datetime) -> str:
     return f"{date_value.year}.{MONTH_ABBREVIATIONS[date_value.month]}.{date_value.day:02d}."
 
 
+# Helper to create BeautifulSoup consistently
+def make_soup(html_content: str) -> BeautifulSoup:
+    return BeautifulSoup(html_content, features=HTML_PARSER_CONFIG.get("features", "html.parser"))
+
+
 def _month_name_to_number(month_name: str) -> Optional[int]:
     normalized = month_name.strip().lower().rstrip(".")
     return MONTH_NAME_TO_NUMBER.get(normalized)
@@ -356,18 +394,31 @@ def _build_human_date_string(year: int, month: int, day: int) -> Optional[str]:
 def parse_tmit_news(html_content: str, source_url: str) -> Optional[NewsItem]:
     """TMIT (node-hir) típusú hír parsése"""
     try:
-        soup = BeautifulSoup(html_content, features="html.parser", from_encoding="utf-8")
         sel = HTML_SELECTORS["tmit"]
-        
-        article = soup.find(sel["article"]["tag"], class_=sel["article"]["class"])
+        if isinstance(html_content, Tag):
+            article = html_content
+        else:
+            soup = make_soup(html_content)
+            art_class = sel["article"].get("class") or ""
+            article = soup.select_one(f"{sel['article']['tag']}.{art_class}") if art_class else soup.select_one(sel["article"]["tag"])
         if not article:
             logger.debug("TMIT article not found")
             return None
-        
-        title = safe_find_text(article, sel["title"]["tag"], class_=sel["title"]["class"]) or "N/A"
-        image_elem = article.find(sel["image"]["tag"])
+
+        t_class = sel["title"].get("class") or ""
+        title_elem = article.select_one(f"{sel['title']['tag']}.{t_class}") if t_class else article.select_one(sel["title"]["tag"])
+        title = title_elem.get_text(strip=True) if title_elem else "N/A"
+        image_elem = article.find(sel["image"]["tag"]) if sel.get("image") else None
         image_url = validate_url_safety(safe_get_attr(image_elem, 'src'))
-        content = safe_find_text(article, sel["content"]["tag"], attrs=sel["content"]["attrs"]) or ""
+        # content may use attribute selectors
+        content_attrs = sel["content"].get("attrs") if sel.get("content") else None
+        if content_attrs:
+            # take first attribute
+            k, v = next(iter(content_attrs.items()))
+            content_elem = article.select_one(f"{sel['content']['tag']}[{k}='{v}']")
+        else:
+            content_elem = article.select_one(sel["content"]["tag"]) if sel.get("content") else None
+        content = content_elem.get_text(strip=True) if content_elem else ""
         
         return NewsItem(
             title=title,
@@ -383,18 +434,23 @@ def parse_tmit_news(html_content: str, source_url: str) -> Optional[NewsItem]:
 def parse_vik_news(html_content: str, source_url: str) -> Optional[NewsItem]:
     """VIK (news-title-important) típusú hír parsése"""
     try:
-        soup = BeautifulSoup(html_content, features="html.parser", from_encoding="utf-8")
         sel = HTML_SELECTORS["vik"]
-        
-        title_elem = soup.find(sel["title"]["tag"], class_=sel["title"]["class"])
+        if isinstance(html_content, Tag):
+            container = html_content
+        else:
+            container = make_soup(html_content)
+
+        t_class = sel["title"].get("class") or ""
+        title_elem = container.select_one(f"{sel['title']['tag']}.{t_class}") if t_class else container.select_one(sel["title"]["tag"])
         if not title_elem:
             logger.debug("VIK title not found")
             return None
-        
+
         title = title_elem.get_text(strip=True) or "N/A"
-        publish_date = safe_find_text(soup, sel["date"]["tag"], class_=sel["date"]["class"])
-        content = safe_find_text(soup, sel["excerpt"]["tag"], class_=sel["excerpt"]["class"]) or ""
-        image_elem = soup.find(sel["image"]["tag"], class_=sel["image"]["class"])
+        publish_date = safe_find_text(container, sel["date"]["tag"], class_name=sel["date"].get("class"))
+        content = safe_find_text(container, sel["excerpt"]["tag"], class_name=sel["excerpt"].get("class")) or ""
+        i_class = sel["image"].get("class") if sel.get("image") else None
+        image_elem = container.select_one(f"{sel['image']['tag']}.{i_class}") if i_class else container.select_one(sel["image"]["tag"]) if sel.get("image") else None
         image_url = validate_url_safety(safe_get_attr(image_elem, 'src'))
         
         return NewsItem(
@@ -412,17 +468,20 @@ def parse_vik_news(html_content: str, source_url: str) -> Optional[NewsItem]:
 def parse_bme_news(html_content: str, source_url: str) -> Optional[NewsItem]:
     """BME (bme_news_card) típusú hír parsése"""
     try:
-        soup = BeautifulSoup(html_content, features="html.parser", from_encoding="utf-8")
         sel = HTML_SELECTORS["bme_news"]
-        
-        news_card = soup.find(sel["card"]["tag"], class_=sel["card"]["class"])
+        if isinstance(html_content, Tag):
+            news_card = html_content
+        else:
+            container = make_soup(html_content)
+            c_class = sel["card"].get("class") or ""
+            news_card = container.select_one(f"{sel['card']['tag']}.{c_class}") if c_class else container.select_one(sel["card"]["tag"])
         if not news_card:
             logger.debug("BME news card not found")
             return None
         
-        title = safe_find_text(news_card, sel["title"]["tag"], class_=sel["title"]["class"]) or "N/A"
-        publish_date = safe_find_text(news_card, sel["date"]["tag"], class_=sel["date"]["class"])
-        content = safe_find_text(news_card, sel["body"]["tag"], class_=sel["body"]["class"]) or ""
+        title = safe_find_text(news_card, sel["title"]["tag"], class_name=sel["title"].get("class")) or "N/A"
+        publish_date = safe_find_text(news_card, sel["date"]["tag"], class_name=sel["date"].get("class"))
+        content = safe_find_text(news_card, sel["body"]["tag"], class_name=sel["body"].get("class")) or ""
         image_elem = news_card.find(sel["image"]["tag"])
         image_url = validate_url_safety(safe_get_attr(image_elem, 'src'))
         
@@ -441,14 +500,40 @@ def parse_bme_news(html_content: str, source_url: str) -> Optional[NewsItem]:
 def parse_bme_event(html_content: str, source_url: str) -> Optional[EventDetected]:
     """BME event card parsése"""
     try:
-        soup = BeautifulSoup(html_content, features="html.parser", from_encoding="utf-8")
         sel = HTML_SELECTORS["bme_event"]
-        
-        title = safe_find_text(soup, sel["title"]["tag"], class_=sel["title"]["class"]) or "N/A"
-        date_elem = soup.find(sel["date_container"]["tag"], class_=sel["date_container"]["class"])
-        date_str = safe_find_text(date_elem, sel["date"]["tag"], class_=sel["date"]["class"]) or ""
-        location = safe_find_text(soup, sel["location"]["tag"], class_=sel["location"]["class"])
-        content = safe_find_text(soup, sel["body"]["tag"], class_=sel["body"]["class"]) or ""
+        if isinstance(html_content, Tag):
+            container = html_content
+        else:
+            container = make_soup(html_content)
+
+        title = safe_find_text(container, sel["title"]["tag"], class_name=sel["title"].get("class")) or "N/A"
+        dc = sel.get("date_container")
+        if dc:
+            dc_class = dc.get("class") or ""
+            date_elem = container.select_one(f"{dc['tag']}.{dc_class}") if dc_class else container.select_one(dc['tag'])
+        else:
+            date_elem = None
+        date_str = safe_find_text(date_elem, sel["date"]["tag"], class_name=sel["date"].get("class")) or ""
+        location = safe_find_text(container, sel["location"]["tag"], class_name=sel["location"].get("class")) or "MISSING"
+        content = safe_find_text(container, sel["body"]["tag"], class_name=sel["body"].get("class")) or "MISSING"
+
+        # Attempt to extract registration link and participants if selectors exist
+        reg_url = "MISSING"
+        participants = ["MISSING"]
+        reg_sel = sel.get("registration")
+        if reg_sel:
+            r_class = reg_sel.get("class") or ""
+            reg_elem = container.select_one(f"{reg_sel['tag']}.{r_class}") if r_class else container.select_one(reg_sel['tag'])
+            reg_href = safe_get_attr(reg_elem, "href") if reg_elem is not None else None
+            reg_url = validate_url_safety(reg_href) or "MISSING"
+
+        part_sel = sel.get("participants")
+        if part_sel:
+            p_class = part_sel.get("class") or ""
+            part_elem = container.select_one(f"{part_sel['tag']}.{p_class}") if p_class else container.select_one(part_sel['tag'])
+            if part_elem:
+                text = part_elem.get_text(separator=",", strip=True)
+                participants = [p.strip() for p in text.split(",") if p.strip()] or ["MISSING"]
         
         event_type = detect_event_type(title)
         
@@ -458,9 +543,10 @@ def parse_bme_event(html_content: str, source_url: str) -> Optional[EventDetecte
             location=location,
             event_type=event_type,
             content=content,
-            registration_url=None,
+            registration_url=reg_url,
             source_url=str(source_url),
-            social_posts=None
+            social_posts=SocialMediaPosts(),
+            participants=participants
         )
     except (AttributeError, TypeError, ValueError) as e:
         logger.error(f"Error parsing BME event: {e}")
@@ -469,21 +555,43 @@ def parse_bme_event(html_content: str, source_url: str) -> Optional[EventDetecte
 def parse_simple_event(html_content: str, source_url: str) -> Optional[EventDetected]:
     """Egyszerű event formátum parsése (VIK)"""
     try:
-        soup = BeautifulSoup(html_content, features="html.parser", from_encoding="utf-8")
         sel = HTML_SELECTORS["simple_event"]
-        
-        date_str = safe_find_text(soup, sel["date"]["tag"], class_=sel["date"]["class"]) or ""
-        title = safe_find_text(soup, sel["title"]["tag"], class_=sel["title"]["class"]) or "N/A"
-        
+        if isinstance(html_content, Tag):
+            container = html_content
+        else:
+            container = make_soup(html_content)
+
+        date_str = safe_find_text(container, sel["date"]["tag"], class_name=sel["date"].get("class")) or ""
+        title = safe_find_text(container, sel["title"]["tag"], class_name=sel["title"].get("class")) or "N/A"
+
+        # registration and participants
+        reg_url = "MISSING"
+        participants = ["MISSING"]
+        reg_sel = sel.get("registration")
+        if reg_sel:
+            r_class = reg_sel.get("class") or ""
+            reg_elem = container.select_one(f"{reg_sel['tag']}.{r_class}") if r_class else container.select_one(reg_sel['tag'])
+            reg_href = safe_get_attr(reg_elem, "href") if reg_elem is not None else None
+            reg_url = validate_url_safety(reg_href) or "MISSING"
+
+        part_sel = sel.get("participants")
+        if part_sel:
+            p_class = part_sel.get("class") or ""
+            part_elem = container.select_one(f"{part_sel['tag']}.{p_class}") if p_class else container.select_one(part_sel['tag'])
+            if part_elem:
+                text = part_elem.get_text(separator=",", strip=True)
+                participants = [p.strip() for p in text.split(",") if p.strip()] or ["MISSING"]
+
         return EventDetected(
             title=title,
             date=parse_date_string(date_str),
-            location=None,
+            location="MISSING",
             event_type=EventType.OTHER,
-            content="",
-            registration_url=None,
+            content="MISSING",
+            registration_url=reg_url,
             source_url=str(source_url),
-            social_posts=None
+            social_posts=SocialMediaPosts(),
+            participants=participants
         )
     except (AttributeError, TypeError, ValueError) as e:
         logger.error(f"Error parsing simple event: {e}")
@@ -608,7 +716,7 @@ async def parse_html_and_extract_news(html_content: str, source_url: str) -> Dic
                 "error": "Source URL szükséges"
             }
         
-        soup = BeautifulSoup(html_content, features="html.parser", from_encoding="utf-8")
+        soup = make_soup(html_content)
         
         # Extract news and events using helper functions
         tmit_news = _extract_tmit_news(soup, source_url)
@@ -778,35 +886,16 @@ async def generate_social_posts(
                 logger.warning(f"Invalid platform: {platform}")
                 raise ValueError(f"Invalid platform: {platform}")
         
-        # Alapértelmezett template-ek a posztokhoz
-        templates = {
-            "facebook": f"""
-Kedves közösség! 🎓
-
-{news_title}
-
-{news_content}
-
-Tudj meg többet: {validated_source_url}
-""",
-            "linkedin": f"""
-{news_title}
-
-{news_content}
-
-📌 Tudj meg többet:
-{validated_source_url}
-
-#BME #Hírek #Oktatás
-""",
-            "x": f"{news_title}\n\n{news_content[:200]}...\n\n{validated_source_url}",
-            "instagram": f"{news_title}\n.\n{news_content}\n\n#BME #Egyetem #Hírek",
-            "discord": {
-                "title": news_title,
-                "description": news_content,
-                "url": validated_source_url
-            }
-        }
+        # Fill templates from SOCIAL_TEMPLATES
+        templates = {}
+        for key, val in SOCIAL_TEMPLATES.items():
+            if isinstance(val, dict):
+                templates[key] = {k: v.format(title=news_title, content=news_content, url=validated_source_url) for k, v in val.items()}
+            else:
+                if key == "x":
+                    templates[key] = val.format(title=news_title, content=news_content, content_slice=news_content[:200], url=validated_source_url)
+                else:
+                    templates[key] = val.format(title=news_title, content=news_content, url=validated_source_url)
         
         result = {}
         
