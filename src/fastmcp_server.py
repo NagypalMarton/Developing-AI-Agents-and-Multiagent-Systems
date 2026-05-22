@@ -181,14 +181,18 @@ def safe_extract_news(soup, source_url: str, extract_func: Callable, selector_ke
     news_items = []
     try:
         sel = HTML_SELECTORS[selector_key]
-        items = soup.find_all(sel["parent"]["tag"], class_=sel["parent"]["class"]) if "parent" in sel else soup.find_all(sel["card"]["tag"], class_=sel["card"]["class"])
+        container_selector = sel.get("article") or sel.get("parent") or sel.get("card") or sel.get("container")
+        if not container_selector:
+            raise KeyError(f"No container selector configured for {selector_key}")
+
+        items = soup.find_all(container_selector["tag"], class_=container_selector["class"])
         for item in items:
             html_str = str(item)
             news = extract_func(html_str, source_url)
             if news:
                 news_items.append(news.model_dump(mode="json", exclude_none=False))
         logger.info(f"Found {len(items)} {log_name}")
-    except (AttributeError, TypeError, ValueError) as e:
+    except (AttributeError, TypeError, ValueError, KeyError) as e:
         logger.error(f"Error parsing {log_name}: {e}")
     return news_items
 
