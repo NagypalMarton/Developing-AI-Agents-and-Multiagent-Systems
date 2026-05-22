@@ -69,7 +69,6 @@ HTML_SELECTORS = {
         "date": {"tag": "span", "class": "event-date"},
         "title": {"tag": "a", "class": "event-title"},
         "container": {"tag": "div", "class": "event"},
-        "registration": {"tag": "a", "class": "registration-link"},
         "participants": {"tag": "p", "class": "event-participants"}
     }
 }
@@ -155,6 +154,7 @@ class NewsItem(BaseModel):
     title: str
     content: str
     image_url: Optional[str] = None
+    registration_url: Optional[str] = None
     source_url: str
     publish_date: Optional[str] = None
     events: List[EventDetected] = Field(default_factory=list)
@@ -317,11 +317,38 @@ def validate_url_safety(url: Optional[str]) -> Optional[str]:
         logger.warning(f"URL validation failed: {e}")
         return None
 
+
+def extract_registration_url_from_text(*text_candidates: Optional[str]) -> Optional[str]:
+    """Extract the most likely registration URL from visible text or raw HTML."""
+    parts = [text.strip() for text in text_candidates if isinstance(text, str) and text.strip()]
+    if not parts:
+        return None
+
+    combined_text = "\n".join(parts)
+
+    hint_match = REGEX_REGISTRATION_HINT.search(combined_text)
+    if hint_match:
+        hinted_url = validate_url_safety(hint_match.group(1).rstrip(').,;:!>\"\''))
+        if hinted_url:
+            return hinted_url
+
+    for url_match in REGEX_URL.finditer(combined_text):
+        candidate_url = validate_url_safety(url_match.group(0).rstrip(').,;:!>\"\''))
+        if candidate_url:
+            return candidate_url
+
+    return None
+
 # Pre-compiled regex patterns
 REGEX_HUNGARIAN_DATE = re.compile(r'(\d{4})\D+(\d{1,2})\D+(\d{1,2})')
 REGEX_HUMAN_DATE = re.compile(r'(\d{4})[.\-/\s]+([A-Za-z]{3,9})[.\-/\s]+(\d{1,2})(?:\.)?')
 REGEX_TIME = re.compile(r'(\d{1,2}):(\d{2})')
-REGEX_LOCATION = re.compile(r'(?:helyszín|location|hely)[\s:]*([^,.\n]+)', re.IGNORECASE)
+REGEX_URL = re.compile(r'https?://[^\s<>"\'\]]+', re.IGNORECASE)
+REGEX_REGISTRATION_HINT = re.compile(
+    r'(?:regisztráci(?:ó|os)|jelentkez(?:és|esi)|register|registration|sign\s*up)'
+    r'[^\n]{0,120}?(https?://[^\s<>"\'\]]+)',
+    re.IGNORECASE,
+)
 
 MONTH_ABBREVIATIONS = {
     1: "Jan",
@@ -419,11 +446,14 @@ def parse_tmit_news(html_content: str, source_url: str) -> Optional[NewsItem]:
         else:
             content_elem = article.select_one(sel["content"]["tag"]) if sel.get("content") else None
         content = content_elem.get_text(strip=True) if content_elem else ""
+        raw_text = article.get_text(separator=" ", strip=True)
+        registration_url = extract_registration_url_from_text(content, raw_text, str(article))
         
         return NewsItem(
             title=title,
             content=content,
             image_url=image_url,
+            registration_url=registration_url,
             source_url=str(source_url),
             social_posts=None
         )
@@ -452,11 +482,14 @@ def parse_vik_news(html_content: str, source_url: str) -> Optional[NewsItem]:
         i_class = sel["image"].get("class") if sel.get("image") else None
         image_elem = container.select_one(f"{sel['image']['tag']}.{i_class}") if i_class else container.select_one(sel["image"]["tag"]) if sel.get("image") else None
         image_url = validate_url_safety(safe_get_attr(image_elem, 'src'))
+        raw_text = container.get_text(separator=" ", strip=True)
+        registration_url = extract_registration_url_from_text(content, raw_text, str(container))
         
         return NewsItem(
             title=title,
             content=content,
             image_url=image_url,
+            registration_url=registration_url,
             source_url=str(source_url),
             publish_date=publish_date,
             social_posts=None
@@ -484,11 +517,14 @@ def parse_bme_news(html_content: str, source_url: str) -> Optional[NewsItem]:
         content = safe_find_text(news_card, sel["body"]["tag"], class_name=sel["body"].get("class")) or ""
         image_elem = news_card.find(sel["image"]["tag"])
         image_url = validate_url_safety(safe_get_attr(image_elem, 'src'))
+        raw_text = news_card.get_text(separator=" ", strip=True)
+        registration_url = extract_registration_url_from_text(content, raw_text, str(news_card))
         
         return NewsItem(
             title=title,
             content=content,
             image_url=image_url,
+            registration_url=registration_url,
             source_url=str(source_url),
             publish_date=publish_date,
             social_posts=None
@@ -516,16 +552,11 @@ def parse_bme_event(html_content: str, source_url: str) -> Optional[EventDetecte
         date_str = safe_find_text(date_elem, sel["date"]["tag"], class_name=sel["date"].get("class")) or ""
         location = safe_find_text(container, sel["location"]["tag"], class_name=sel["location"].get("class")) or "MISSING"
         content = safe_find_text(container, sel["body"]["tag"], class_name=sel["body"].get("class")) or "MISSING"
+        raw_text = container.get_text(separator=" ", strip=True)
 
-        # Attempt to extract registration link and participants if selectors exist
-        reg_url = "MISSING"
+        # Extract registration link from the visible text / raw HTML source
+        reg_url = extract_registration_url_from_text(content, raw_text, str(container)) or "MISSING"
         participants = ["MISSING"]
-        reg_sel = sel.get("registration")
-        if reg_sel:
-            r_class = reg_sel.get("class") or ""
-            reg_elem = container.select_one(f"{reg_sel['tag']}.{r_class}") if r_class else container.select_one(reg_sel['tag'])
-            reg_href = safe_get_attr(reg_elem, "href") if reg_elem is not None else None
-            reg_url = validate_url_safety(reg_href) or "MISSING"
 
         part_sel = sel.get("participants")
         if part_sel:
@@ -760,81 +791,6 @@ async def parse_html_and_extract_news(html_content: str, source_url: str) -> Dic
         }
 
 @mcp.tool()
-async def detect_events_from_content(content: str, current_date: Optional[str] = None) -> Dict[str, Any]:
-    """
-    LLM segítségével részletesebb eseményadatok detektálása szövegből.
-    
-    Kimenete: JSON lista EventDetected sémával.
-    
-    Raises:
-    - ValueError: Ha input nem megfelelő
-    """
-    try:
-        # Input validation
-        if not content or not isinstance(content, str):
-            logger.warning("Invalid content for event detection")
-            raise ValueError("Content must be non-empty string")
-        
-        if not current_date:
-            current_date = _format_human_date(datetime.now())
-        else:
-            # Validate ISO format if provided
-            try:
-                parse_date_string(current_date)
-            except ValueError as e:
-                logger.warning(f"Invalid date format: {current_date}")
-                raise ValueError(f"Invalid date format: {str(e)}")
-        
-        # Regex alapú detektálás
-        try:
-            dates_found = []
-            for year_str, month_name, day_str in REGEX_HUMAN_DATE.findall(content):
-                month_number = _month_name_to_number(month_name)
-                if month_number:
-                    formatted_date = _build_human_date_string(int(year_str), month_number, int(day_str))
-                    if formatted_date:
-                        dates_found.append(formatted_date)
-
-            for year_str, month_str, day_str in REGEX_HUNGARIAN_DATE.findall(content):
-                formatted_date = _build_human_date_string(int(year_str), int(month_str), int(day_str))
-                if formatted_date:
-                    dates_found.append(formatted_date)
-
-            # Preserve order while removing duplicates
-            dates_found = list(dict.fromkeys(dates_found))
-            locations_found = re.findall(REGEX_LOCATION.pattern, content)
-            
-            logger.info(f"Found {len(dates_found)} dates and {len(locations_found)} locations")
-            
-            return {
-                "status": "success",
-                "dates_found": dates_found[:10],  # Limit to 10
-                "locations_found": locations_found[:10],  # Limit to 10
-                "message": "Content processed. Use with LLM for full event extraction.",
-                "current_date": current_date
-            }
-        except re.error as e:
-            logger.error(f"Regex error in event detection: {e}")
-            raise ValueError(f"Regex parsing error: {str(e)}")
-    
-    except ValueError as e:
-        logger.error(f"Validation error in detect_events_from_content: {e}")
-        return {
-            "status": "error",
-            "error": f"Validation error: {str(e)}",
-            "dates_found": [],
-            "locations_found": []
-        }
-    except Exception as e:
-        logger.exception(f"Unexpected error in detect_events_from_content: {e}")
-        return {
-            "status": "error",
-            "error": f"Unexpected error: {str(e)}",
-            "dates_found": [],
-            "locations_found": []
-        }
-
-@mcp.tool()
 async def generate_social_posts(
     news_title: str,
     news_content: str,
@@ -878,6 +834,10 @@ async def generate_social_posts(
         
         if not events:
             events = []
+
+        news_registration_url = extract_registration_url_from_text(news_content, news_title)
+        event_registration_url = events[0].get("registration_url") if events else None
+        resolved_registration_url = validate_url_safety(event_registration_url or news_registration_url)
         
         # Validate platform names
         valid_platforms = {p.value for p in PlatformType}
@@ -904,8 +864,8 @@ async def generate_social_posts(
                 result["facebook"] = {
                     "content": templates["facebook"][:FACEBOOK_MAX_LENGTH],
                     "hashtags": ["#BME", "#Hírek"],
-                    "cta_button": "Tudj meg többet" if events else None,
-                    "cta_url": events[0].get("registration_url") if events else None
+                    "cta_button": "Tudj meg többet" if resolved_registration_url else None,
+                    "cta_url": resolved_registration_url
                 }
             
             if "linkedin" in platforms:
@@ -914,7 +874,7 @@ async def generate_social_posts(
                     "body": templates["linkedin"],
                     "hashtags": ["BME", "Hírek", "Oktatás"],
                     "cta_text": "Regisztrálj",
-                    "cta_url": events[0].get("registration_url") if events else validated_source_url
+                    "cta_url": resolved_registration_url or validated_source_url
                 }
             
             if "x" in platforms:
@@ -971,102 +931,6 @@ async def generate_social_posts(
             "posts": {},
             "platforms_generated": [],
             "event_count": 0
-        }
-
-@mcp.tool()
-async def enrich_with_registration_link(
-    post: Dict[str, Any],
-    event: Dict[str, Any],
-    platform: str
-) -> Dict[str, Any]:
-    """
-    Regisztrációs link injektálása az eseményt tartalmazó posztokba.
-    
-    Raises:
-    - ValueError: Ha input nem megfelelő
-    """
-    try:
-        if not post or not isinstance(post, dict):
-            logger.warning("Invalid post object for enrichment")
-            raise ValueError("Post objektum szükséges")
-        
-        if not event or not isinstance(event, dict):
-            logger.warning("Invalid event object for enrichment")
-            raise ValueError("Event objektum szükséges")
-        
-        if not platform or platform not in [p.value for p in PlatformType]:
-            logger.warning(f"Invalid platform: {platform}")
-            raise ValueError(f"Érvénytelen platform: {platform}")
-        
-        registration_url = event.get("registration_url") or event.get("source_url")
-        
-        if not registration_url:
-            logger.info("No registration URL found for event enrichment")
-            return {
-                "status": "warning",
-                "message": "No registration URL found",
-                "enriched_post": post
-            }
-        
-        # Sanitize URL
-        registration_url = validate_url_safety(registration_url)
-        if not registration_url:
-            logger.warning("Registration URL failed validation")
-            return {
-                "status": "warning",
-                "message": "Registration URL failed validation",
-                "enriched_post": post
-            }
-        
-        enriched = post.copy()
-        event_title = event.get("title", "").strip()
-        event_date = event.get("date", "").strip()
-        
-        if platform == PlatformType.FACEBOOK.value:
-            enriched["content"] += f"\n\n📅 {event_title} ({event_date})\n🔗 Regisztrálj: {registration_url}"
-        
-        elif platform == PlatformType.LINKEDIN.value:
-            enriched["body"] += f"\n\n🎯 {event_title}\n🗓️ {event_date}\n\n👉 {registration_url}"
-        
-        elif platform == PlatformType.X.value:
-            enriched["content"] = enriched.get("content", "")[:250] + f"\n🔗 {registration_url}"
-        
-        elif platform == PlatformType.INSTAGRAM.value:
-            enriched["caption"] = enriched.get("caption", "") + f"\n\n📌 {event_title}\n{registration_url}"
-        
-        elif platform == PlatformType.DISCORD.value:
-            if "embed_fields" not in enriched:
-                enriched["embed_fields"] = {}
-            enriched["embed_fields"]["Regisztráció"] = registration_url
-            enriched["embed_fields"]["Dátum"] = event_date
-        
-        logger.info(f"Successfully enriched post for {platform}")
-        return {
-            "status": "success",
-            "enriched_post": enriched,
-            "platform": platform
-        }
-    
-    except ValueError as e:
-        logger.error(f"Validation error in enrich_with_registration_link: {e}")
-        return {
-            "status": "error",
-            "error": f"Validation error: {str(e)}",
-            "enriched_post": post
-        }
-    except KeyError as e:
-        logger.error(f"Missing key in enrich_with_registration_link: {e}")
-        return {
-            "status": "error",
-            "error": f"Missing required field: {str(e)}",
-            "enriched_post": post
-        }
-    except Exception as e:
-        logger.exception(f"Unexpected error in enrich_with_registration_link: {e}")
-        return {
-            "status": "error",
-            "error": f"Unexpected error: {str(e)}",
-            "enriched_post": post
         }
 
 # ============================================================================
