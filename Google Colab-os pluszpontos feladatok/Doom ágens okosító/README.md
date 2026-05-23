@@ -218,6 +218,25 @@ def recall(key: str) -> str:
     return store.get(key, "Not found")
 ```
 
+### Memory MCP server (example)
+
+Start the simple in-repo memory MCP server (provides `remember`/`recall` and planning tools):
+
+```bash
+cd tetsuo-doom
+uv run fastmcp run src/doom_mcp/memory_server.py --transport sse --port 8002
+```
+
+Then set the environment variable used by the agent runner (optional):
+
+```bash
+export MEMORY_MCP_URL=http://localhost:8002/sse    # Unix
+setx MEMORY_MCP_URL "http://localhost:8002/sse"  # Windows (persist)
+```
+
+The `doom_player` in `doom-bot.py` is configured to use `MEMORY_MCP_URL`.
+
+
 ## Project structure
 
 ```

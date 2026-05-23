@@ -1,0 +1,8 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "/^python -m py_compile \"c:/Users/nagyp/\\.vscode/Developing-AI-Agents-and-Multiagent-Systems/Google Colab-os pluszpontos feladatok/Doom ágens okosító/tetsuo-doom/src/doom_mcp/memory_server\\.py\"$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
+}
