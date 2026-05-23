@@ -7,5 +7,5 @@ requires-python = ">=3.14"
 dependencies = [
     "pydantic-ai>=1.89.1",
     "sshtunnel>=0.4.0",
-    "paramiko<3",
+    "paramiko<4",
 ]

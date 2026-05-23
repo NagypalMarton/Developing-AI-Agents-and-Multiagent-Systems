@@ -41,6 +41,15 @@ Run the agent:
 uv run main.py
 ```
 
+If you only use the local Ollama model and do not need the remote SSH tunnel,
+leave `ENABLE_SSH_TUNNEL` unset. Set `ENABLE_SSH_TUNNEL=1` only if you really
+need the remote host forwarding used by the original lab setup.
+
+The agent also tries to start the local Doom MCP backend automatically from
+`tetsuo-doom/` if it is not already running. Override the SSE URL with
+`DOOM_MCP_URL` if needed, and set `AUTO_START_DOOM_MCP=0` to disable the
+auto-start behavior.
+
 The agent will open a Doom window, start exploring MAP01, and run for 10 commander
 turns before stopping.
 
@@ -162,10 +171,14 @@ point. Experiment with improving them:
 - Reduce token usage: trim verbose instructions that the model already follows
 - Test whether shorter or longer instructions work better for your chosen model
 
-Try different models by changing the `provider` variable in `main.py`:
+Try different models by changing the `provider` variable in `main.py` (or
+update `doom-bot.py` if you use that entrypoint):
 ```python
-provider = "OpenAI"   # uses OpenAI via OPENAI_API_KEY in .env
-provider = "Ollama"   # uses gemma4:latest via local Ollama
+# Use Ollama (recommended for local inference): set `OLLAMA_BASE_URL` in `.env`
+provider = "Ollama"   # uses gemma models via local Ollama (e.g. 'gemma4:latest')
+
+# Or keep an OpenAI-compatible endpoint if you have one:
+provider = "OpenAI"   # uses OPENAI_API_KEY and OPENAI_BASE_URL in `.env`
 ```
 
 ### 5. Ideas to explore (open-ended)
@@ -211,7 +224,7 @@ def recall(key: str) -> str:
 doom-gyak/
 ├── main.py              # Agent loop — edit this
 ├── pyproject.toml
-├── .env                 # API keys (OPENAI_API_KEY, etc.)
+├── .env                 # API keys (OPENAI_API_KEY) and endpoints (OLLAMA_BASE_URL)
 └── tetsuo-doom/         # Doom MCP server — read-only reference
     └── src/doom_mcp/
         ├── server.py    # Tool definitions

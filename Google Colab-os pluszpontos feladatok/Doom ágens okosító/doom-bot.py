@@ -2,10 +2,19 @@ import asyncio
 import json
 import logging
 import os
+import shutil
+import subprocess
+import sys
+import time
+import urllib.request
+from pathlib import Path
 from dotenv import load_dotenv
 load_dotenv()
 
-from sshtunnel import SSHTunnelForwarder
+try:
+    from sshtunnel import SSHTunnelForwarder
+except ImportError:
+    SSHTunnelForwarder = None
 
 from rich.console import Console
 from rich.logging import RichHandler
@@ -76,23 +85,117 @@ async def log_tool_result(_ctx: RunContext[None], *, call: ToolCallPart, tool_de
 
 
 
-tunnel = SSHTunnelForwarder(
-    ("spark.mit.bme.hu", 10222),
-    ssh_username="uname",
-    ssh_pkey="/Users/uname/.ssh/id_rsa",
-    ssh_private_key_password=os.getenv("SSH_KEY_PASSWORD"),
-    remote_bind_address=("localhost", 8000),
-    local_bind_address=("localhost", 8000),
+# The SSH tunnel is only needed for remote resources. Keep it opt-in so the
+# local Ollama workflow does not depend on sshtunnel/paramiko compatibility.
+tunnel = None
+if os.getenv("ENABLE_SSH_TUNNEL", "0") == "1":
+    if SSHTunnelForwarder is None:
+        raise RuntimeError("ENABLE_SSH_TUNNEL=1 requires the sshtunnel package to be installed.")
+    try:
+        tunnel = SSHTunnelForwarder(
+            ("spark.mit.bme.hu", 10222),
+            ssh_username="uname",
+            ssh_pkey="/Users/uname/.ssh/id_rsa",
+            ssh_private_key_password=os.getenv("SSH_KEY_PASSWORD"),
+            remote_bind_address=("localhost", 8000),
+            local_bind_address=("localhost", 8000),
+        )
+        tunnel.start()
+    except Exception as exc:
+        log.warning("SSH tunnel startup failed; continuing without it: %s", exc)
+# Use Ollama by default. Ollama should be running locally or reachable via OLLAMA_BASE_URL.
+# Adjust model name to one available in your Ollama instance via OLLAMA_MODEL.
+# Example models present locally: 'qwen3.5:2b-q4_K_M', 'qwen3.5:cloud', 'qwen3-coder-next:cloud'.
+ollama_provider = OllamaProvider(
+    base_url=os.getenv('OLLAMA_BASE_URL', "http://localhost:11434/v1"),
 )
+model = OllamaModel(os.getenv('OLLAMA_MODEL', 'qwen3-coder-next:cloud'), provider=ollama_provider)
 
-tunnel.start()
-model = OpenAIChatModel(
-    model_name='google/gemma-4-31B-it',  # pl. 'qwen2.5-7b-instruct'
-    provider=OpenAIProvider(
-        base_url=os.getenv('OPENAI_BASE_URL', "http://spark.mit.bme.hu:8888/v1"),
-        api_key=os.getenv('OPENAI_API_KEY'),
-    ),
-)
+
+def _server_url() -> str:
+    port = os.getenv("DOOM_MCP_PORT", "8001")
+    return os.getenv("DOOM_MCP_URL", f"http://localhost:{port}/sse")
+
+
+def _server_is_ready(url: str, timeout: float = 1.0) -> bool:
+    try:
+        with urllib.request.urlopen(url, timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+
+def _start_doom_mcp_server() -> subprocess.Popen:
+    project_root = Path(__file__).resolve().parent / "tetsuo-doom"
+    if not project_root.exists():
+        raise RuntimeError(f"Cannot find tetsuo-doom backend at {project_root}")
+
+    venv_fastmcp = Path(sys.executable).with_name("fastmcp.exe")
+    if venv_fastmcp.exists():
+        fastmcp_executable = str(venv_fastmcp)
+    else:
+        fastmcp_executable = shutil.which("fastmcp")
+    if fastmcp_executable is None:
+        raise RuntimeError("fastmcp is required to auto-start the Doom MCP server, but it was not found on PATH or in the active virtual environment.")
+
+    try:
+        import fastmcp  # noqa: F401
+    except ImportError as exc:
+        raise RuntimeError(
+            "fastmcp is not available in the current Python environment; install the project dependencies first."
+        ) from exc
+
+    env = os.environ.copy()
+    src_path = str(project_root / "src")
+    env["PYTHONPATH"] = src_path + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    port = os.getenv("DOOM_MCP_PORT", "8001")
+
+    return subprocess.Popen(
+        [fastmcp_executable, "run", "src/doom_mcp/server.py", "--transport", "sse", "--port", port],
+        cwd=str(project_root),
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+
+
+def _tail_text(lines: str | bytes, limit: int = 20) -> str:
+    if isinstance(lines, bytes):
+        lines = lines.decode("utf-8", errors="replace")
+    parts = [line.rstrip() for line in lines.splitlines() if line.strip()]
+    if not parts:
+        return ""
+    return "\n".join(parts[-limit:])
+
+
+def ensure_doom_mcp_server(url: str | None = None) -> None:
+    target_url = url or _server_url()
+    if _server_is_ready(target_url):
+        return
+
+    if os.getenv("AUTO_START_DOOM_MCP", "1") != "1":
+        raise RuntimeError(
+            f"Doom MCP server is not reachable at {target_url}. Start it manually or set AUTO_START_DOOM_MCP=1."
+        )
+
+    proc = _start_doom_mcp_server()
+
+    for _ in range(30):
+        if _server_is_ready(target_url, timeout=1.5):
+            return
+        if proc.poll() is not None:
+            stderr_output = proc.stderr.read() if proc.stderr is not None else ""
+            raise RuntimeError(
+                f"Doom MCP server exited before becoming ready at {target_url}.\n"
+                f"Backend stderr:\n{_tail_text(stderr_output)}"
+            )
+        time.sleep(0.5)
+
+    stderr_output = proc.stderr.read() if proc.stderr is not None else ""
+    raise RuntimeError(
+        f"Doom MCP server did not become ready at {target_url}.\n"
+        f"Backend stderr:\n{_tail_text(stderr_output)}"
+    )
 
 
 
@@ -112,52 +215,48 @@ Each turn you receive ONE objective. Execute it with the minimum tool calls need
 You MUST use your tools — do not describe actions, execute them.
 
 ## Startup
-If no game is running, call start_game(wad="freedoom2", map_name="MAP02", window_visible=true, difficulty=3).
-Call start_game ALONE — do not call any other tool in the same turn.
-Wait for start_game to return before calling explore or any other tool.
-Do not call start_game again unless the game crashes.
+If no game is running, start a new Doom II game on MAP02 with difficulty 3 and a visible window if available.
+Call `start_game` alone and wait for it to finish before doing anything else.
+Do not call `start_game` again unless the game crashes.
 
 ## One task per turn
 Execute exactly the objective given by the commander. Do not chain multiple objectives.
-- If told to explore: call explore() once, then report what you found.
-- If told to fight an enemy: call get_threat_assessment(), then aim_and_shoot or strafe_and_shoot once, then report.
-- If told to collect an item: call move_to(object_id=<id>) once, then report.
-- If told to open a door or use a switch: call move_to(object_id=<id>, use=true) once, then report.
+- If told to explore, call the `explore` tool once.
+- If told to fight an enemy, call `get_threat_assessment` first, then `aim_and_shoot` or `strafe_and_shoot` once.
+- If told to collect an item, call `move_to` once with the target object id.
+- If told to open a door or use a switch, call `move_to` once with the target object id and use enabled.
 Stop after completing the task. Do not keep exploring or fighting after the objective is done.
 
 ## Exploration
-- explore(stop_on_enemy=true) — walks until an enemy appears. Report what you see.
-- explore(stop_on_item=true) — walks until a health/ammo/weapon appears. Report what you see.
-- If explore returns stop_reason="stuck" or "max_tics": call get_navigation_info() to find a new direction, then report it.
+- Use `explore` with stop options to stop on enemies or items.
+- If `explore` returns stuck or max tics, call `get_navigation_info` and continue exploring.
 
 ## Combat
-- get_threat_assessment() — returns enemy IDs and priorities.
-- strafe_and_shoot(object_id=<id>) — use against hitscan enemies (chaingunner, former human).
-- aim_and_shoot(object_id=<id>) — use against all other enemies.
-- retreat() — move away when health is critical.
+- `get_threat_assessment` returns enemy IDs and priorities.
+- `strafe_and_shoot` is for hitscan enemies such as chaingunners and former humans.
+- `aim_and_shoot` is for other enemies.
+- `retreat` moves away when health is critical.
 
 ## Doors and keys
 Doom doors are opened by walking up and using them. Keys unlock color-coded locked doors.
-- Doors: call move_to(object_id=<door_id>, use=true). If the door does not open, it requires a key.
-- Keys (RedCard, BlueCard, YellowCard, RedSkull, BlueSkull, YellowSkull): visible in get_objects() with type="key".
-  Collect a key with move_to(object_id=<key_id>). After collecting, the matching locked door can be opened.
-- Locked doors are named things like "Door, Red Key" or "Door, Blue Key" — match key color to door color.
-- If you spot a key or locked door, report its object_id and color so the commander can plan.
+- Call `move_to` with use enabled for doors and switches.
+- Keys are visible in `get_objects` with type `key`.
+- If you spot a key or locked door, report its object id and color so the commander can plan.
 
 ## Items and switches
-- Collect items (health, ammo, weapons): move_to(object_id=<id>).
-- Activate switches: move_to(object_id=<id>, use=true).
+- Collect items by calling `move_to` with the target object id.
+- Activate switches by calling `move_to` with use enabled.
 
 ## Exit
-- Scan get_objects() for names containing "exit", "switch", or "teleport".
-- Call move_to(object_id=<id>, use=true) to finish the level.
-- When episode_finished=true in any result, call new_episode() to advance to the next map.
+- Scan `get_objects` for names containing exit, switch, or teleport.
+- Call `move_to` with use enabled to finish the level.
+- When `episode_finished` is true in any result, call `new_episode` to advance to the next map.
 
 ## Rules
-- ALWAYS call a tool. Never describe what you would do.
-- Never call stop_game.
-- Never call take_action directly.
-- One objective per turn — stop after completing it.
+- Always call exactly one tool or a short tool sequence per turn.
+- Never call `stop_game`.
+- Never call `take_action` directly.
+- Stop after completing the objective.
 
 ## After every turn
 Write a report in exactly this format:
@@ -186,37 +285,38 @@ Game control:  start_game, new_episode, get_available_actions
 - You respond with one focused instruction telling the player what to do next.
 
 ## How to evaluate the player's report
-- Health below 40: prioritize retreat + explore(stop_on_item=true) to find health.
+Health below 40: prioritize retreat and then explore for health.
 - Active enemies spotted: prioritize aim_and_shoot or strafe_and_shoot.
-- No enemies, healthy: direct the player to explore(stop_on_enemy=true).
-- Exit or switch found: direct move_to(object_id, use=true) to activate it.
+No enemies, healthy: direct the player to explore for enemies.
+Exit or switch found: direct move_to to activate it.
 - Stuck / max_tics: direct get_navigation_info then explore in a different direction.
-- episode_finished seen: direct new_episode() immediately.
+- episode_finished seen: direct new_episode immediately.
 
 ## How to give instructions
 Respond in exactly this format:
 
   OBJECTIVE: <what to do>
   REASON: <why, based on the player's report>
-  HINT: <exact tool call to use, e.g. explore(stop_on_enemy=true) or aim_and_shoot(object_id=42)>
+    HINT: Call the relevant tool with the target object id or boolean options.
 
 Examples:
   OBJECTIVE: Hunt for enemies.
   REASON: Area is clear and exploration progress is low.
-  HINT: Call explore(stop_on_enemy=true) — when stop_reason="enemy_spotted", use aim_and_shoot(object_id=<id from get_threat_assessment>).
+    HINT: Call `explore`, then use `aim_and_shoot` with the enemy id from `get_threat_assessment`.
 
   OBJECTIVE: Activate the exit switch.
   REASON: No enemies remain and you can see an exit switch in get_objects.
-  HINT: Call move_to(object_id=<switch_id>, use=true).
+    HINT: Call `move_to` with the switch id and use enabled.
 
   OBJECTIVE: Find health — HP is critical.
   REASON: Health is below 30.
-  HINT: Call retreat() then explore(stop_on_item=true); when stop_reason="item_found" call move_to(object_id=<id>).
+    HINT: Call `retreat`, then `explore`; when an item is found, call `move_to` with its object id.
 
 Keep instructions short and actionable. One objective per turn.
 """
 
-doom_mcp = FastMCPToolset('http://localhost:8001/sse', max_retries=3)
+ensure_doom_mcp_server()
+doom_mcp = FastMCPToolset(_server_url(), max_retries=3)
 doom_player = Agent(
     model,
     instructions=INSTRUCTIONS,
@@ -230,8 +330,8 @@ commander = Agent(
     capabilities=[hooks],
 )
 
-PLAYER_LIMITS = UsageLimits(request_limit=5)
-COMMANDER_LIMITS = UsageLimits(request_limit=3)
+PLAYER_LIMITS = UsageLimits(request_limit=20)
+COMMANDER_LIMITS = UsageLimits(request_limit=10)
 
 def _panel(text: str | None, title: str, border: str) -> Panel:
     return Panel(escape(text or "(no output)"), title=title, border_style=border)
@@ -243,7 +343,7 @@ async def main():
 
     try:
         result = await doom_player.run(
-            'Start playing! call the start_game tool',
+            'Start the game and begin play.',
             usage_limits=PLAYER_LIMITS,
         )
         player_output = result.output or ""
@@ -280,4 +380,5 @@ async def main():
 if __name__ == "__main__":
     asyncio.run(main())
 
-tunnel.stop()
+if tunnel is not None:
+    tunnel.stop()
