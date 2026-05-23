@@ -7,7 +7,7 @@ from enum import Enum
 from urllib.parse import urlparse
 from contextlib import asynccontextmanager
 from pydantic import BaseModel, Field, field_validator, HttpUrl
-from bs4 import BeautifulSoup, Tag
+from bs4 import BeautifulSoup
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from fastapi import FastAPI
@@ -68,21 +68,7 @@ HTML_SELECTORS = {
     "simple_event": {
         "date": {"tag": "span", "class": "event-date"},
         "title": {"tag": "a", "class": "event-title"},
-        "container": {"tag": "div", "class": "event"},
-        "participants": {"tag": "p", "class": "event-participants"}
-    }
-}
-
-# Social templates (use format placeholders: {title}, {content}, {url})
-SOCIAL_TEMPLATES = {
-    "facebook": "Kedves közösség! 🎓\n\n{title}\n\n{content}\n\nTudj meg többet: {url}\n",
-    "linkedin": "{title}\n\n{content}\n\n📌 Tudj meg többet:\n{url}\n\n#BME #Hírek #Oktatás\n",
-    "x": "{title}\n\n{content_slice}...\n\n{url}",
-    "instagram": "{title}\n.\n{content}\n\n#BME #Egyetem #Hírek",
-    "discord": {
-        "title": "{title}",
-        "description": "{content}",
-        "url": "{url}"
+        "container": {"tag": "div", "class": "event"}
     }
 }
 
@@ -145,6 +131,7 @@ class EventDetected(BaseModel):
     event_type: EventType = Field(..., description="Esemény típusa")
     content: str = Field(..., description="Esemény tartalma/leírása")
     registration_url: str = Field(..., description="Regisztrációs URL")
+    guests_list: List[str] = Field(..., description="Meghívott vendégek listája")
     source_url: str = Field(..., description="Forrás URL")
     social_posts: SocialMediaPosts = Field(..., description="Social media posztok")
     participants: List[str] = Field(..., description="Résztvevők listája")
@@ -154,7 +141,6 @@ class NewsItem(BaseModel):
     title: str
     content: str
     image_url: Optional[str] = None
-    registration_url: Optional[str] = None
     source_url: str
     publish_date: Optional[str] = None
     events: List[EventDetected] = Field(default_factory=list)
@@ -201,8 +187,7 @@ def safe_extract_news(soup, source_url: str, extract_func: Callable, selector_ke
         if not container_selector:
             raise KeyError(f"No container selector configured for {selector_key}")
 
-        class_name = container_selector.get("class") or ""
-        items = soup.select(f"{container_selector['tag']}.{class_name}") if class_name else soup.select(container_selector['tag'])
+        items = soup.find_all(container_selector["tag"], class_=container_selector["class"])
         for item in items:
             html_str = str(item)
             news = extract_func(html_str, source_url)
@@ -230,15 +215,9 @@ def _extract_bme_events(soup, source_url: str) -> List[Dict[str, Any]]:
     events = []
     try:
         sel = HTML_SELECTORS["bme_event"]
-        dc = sel["date_container"]
-        dc_class = dc.get("class") or ""
-        bme_events = soup.select(f"{dc['tag']}.{dc_class}") if dc_class else soup.select(dc['tag'])
+        bme_events = soup.find_all(sel["date_container"]["tag"], class_=sel["date_container"]["class"])
         for event_card in bme_events:
-            parent = event_card.find_parent(sel["parent"]["tag"]) if sel.get("parent") else None
-            if parent and sel.get("parent"):
-                parent_classes = parent.get("class", [])
-                if sel["parent"].get("class") not in parent_classes:
-                    parent = None
+            parent = event_card.find_parent(sel["parent"]["tag"], class_=sel["parent"]["class"])
             if parent:
                 html_str = str(parent)
                 event = parse_bme_event(html_str, source_url)
@@ -254,9 +233,7 @@ def _extract_simple_events(soup, source_url: str) -> List[Dict[str, Any]]:
     events = []
     try:
         sel = HTML_SELECTORS["simple_event"]
-        c = sel["container"]
-        c_class = c.get("class") or ""
-        simple_events = soup.select(f"{c['tag']}.{c_class}") if c_class else soup.select(c['tag'])
+        simple_events = soup.find_all(sel["container"]["tag"], class_=sel["container"]["class"])
         for event_elem in simple_events:
             html_str = str(event_elem)
             event = parse_simple_event(html_str, source_url)
@@ -271,20 +248,12 @@ def _extract_simple_events(soup, source_url: str) -> List[Dict[str, Any]]:
 # PARSING HELPER FUNCTIONS
 # ============================================================================
 
-def safe_find_text(element, tag: str, class_name: Optional[str] = None, attrs: Optional[Dict[str, str]] = None) -> Optional[str]:
-    """Safely extract and strip text from BeautifulSoup element using CSS selectors."""
+def safe_find_text(element, *args, **kwargs) -> Optional[str]:
+    """Safely extract and strip text from BeautifulSoup element"""
     if element is None:
         return None
     try:
-        selector = tag
-        if class_name:
-            selector = f"{tag}.{class_name}"
-        elif attrs:
-            # build attribute selector for the first attr
-            parts = [f'[{k}="{v}"]' for k, v in attrs.items()]
-            selector = tag + ''.join(parts)
-
-        found = element.select_one(selector)
+        found = element.find(*args, **kwargs)
         if found:
             text = found.get_text(strip=True)
             return text if text else None
@@ -318,37 +287,41 @@ def validate_url_safety(url: Optional[str]) -> Optional[str]:
         return None
 
 
-def extract_registration_url_from_text(*text_candidates: Optional[str]) -> Optional[str]:
-    """Extract the most likely registration URL from visible text or raw HTML."""
-    parts = [text.strip() for text in text_candidates if isinstance(text, str) and text.strip()]
-    if not parts:
-        return None
+def extract_registration_url(soup, source_url: str) -> str:
+    """Extract a likely registration URL from event HTML."""
+    candidate_keywords = ("reg", "jelent", "apply", "signup", "sign-up", "register", "registration")
+    for link in soup.find_all("a", href=True):
+        href = validate_url_safety(link.get("href"))
+        if not href:
+            continue
+        link_text = link.get_text(" ", strip=True).lower()
+        href_lower = href.lower()
+        if any(keyword in link_text or keyword in href_lower for keyword in candidate_keywords):
+            return href
 
-    combined_text = "\n".join(parts)
+    return validate_url_safety(source_url) or ""
 
-    hint_match = REGEX_REGISTRATION_HINT.search(combined_text)
-    if hint_match:
-        hinted_url = validate_url_safety(hint_match.group(1).rstrip(').,;:!>\"\''))
-        if hinted_url:
-            return hinted_url
 
-    for url_match in REGEX_URL.finditer(combined_text):
-        candidate_url = validate_url_safety(url_match.group(0).rstrip(').,;:!>\"\''))
-        if candidate_url:
-            return candidate_url
+def extract_guests_list(soup) -> List[str]:
+    """Extract guest/speaker names from event HTML text."""
+    text = soup.get_text("\n", strip=True)
+    guests: List[str] = []
 
-    return None
+    match = REGEX_GUESTS.search(text)
+    if match:
+        raw_value = match.group(1)
+        raw_value = re.split(r"(?:\n|\.|\bhelyszín\b|\bdátum\b|\btime\b)", raw_value, maxsplit=1, flags=re.IGNORECASE)[0]
+        parts = re.split(r"[,;•/]+|\band\b|\bés\b", raw_value, flags=re.IGNORECASE)
+        guests = [part.strip(" -:\t") for part in parts if part and part.strip(" -:\t")]
+
+    return list(dict.fromkeys(guests))
 
 # Pre-compiled regex patterns
 REGEX_HUNGARIAN_DATE = re.compile(r'(\d{4})\D+(\d{1,2})\D+(\d{1,2})')
 REGEX_HUMAN_DATE = re.compile(r'(\d{4})[.\-/\s]+([A-Za-z]{3,9})[.\-/\s]+(\d{1,2})(?:\.)?')
 REGEX_TIME = re.compile(r'(\d{1,2}):(\d{2})')
-REGEX_URL = re.compile(r'https?://[^\s<>"\'\]]+', re.IGNORECASE)
-REGEX_REGISTRATION_HINT = re.compile(
-    r'(?:regisztráci(?:ó|os)|jelentkez(?:és|esi)|register|registration|sign\s*up)'
-    r'[^\n]{0,120}?(https?://[^\s<>"\'\]]+)',
-    re.IGNORECASE,
-)
+REGEX_LOCATION = re.compile(r'(?:helyszín|location|hely)[\s:]*([^,.\n]+)', re.IGNORECASE)
+REGEX_GUESTS = re.compile(r'(?:vendég(?:ek)?|guests?|előadó(?:k)?|speakers?|résztvevő(?:k)?)[\s:.-]*(.+)', re.IGNORECASE)
 
 MONTH_ABBREVIATIONS = {
     1: "Jan",
@@ -397,11 +370,6 @@ def _format_human_date(date_value: datetime) -> str:
     return f"{date_value.year}.{MONTH_ABBREVIATIONS[date_value.month]}.{date_value.day:02d}."
 
 
-# Helper to create BeautifulSoup consistently
-def make_soup(html_content: str) -> BeautifulSoup:
-    return BeautifulSoup(html_content, features=HTML_PARSER_CONFIG.get("features", "html.parser"))
-
-
 def _month_name_to_number(month_name: str) -> Optional[int]:
     normalized = month_name.strip().lower().rstrip(".")
     return MONTH_NAME_TO_NUMBER.get(normalized)
@@ -421,39 +389,23 @@ def _build_human_date_string(year: int, month: int, day: int) -> Optional[str]:
 def parse_tmit_news(html_content: str, source_url: str) -> Optional[NewsItem]:
     """TMIT (node-hir) típusú hír parsése"""
     try:
+        soup = BeautifulSoup(html_content, features="html.parser", from_encoding="utf-8")
         sel = HTML_SELECTORS["tmit"]
-        if isinstance(html_content, Tag):
-            article = html_content
-        else:
-            soup = make_soup(html_content)
-            art_class = sel["article"].get("class") or ""
-            article = soup.select_one(f"{sel['article']['tag']}.{art_class}") if art_class else soup.select_one(sel["article"]["tag"])
+        
+        article = soup.find(sel["article"]["tag"], class_=sel["article"]["class"])
         if not article:
             logger.debug("TMIT article not found")
             return None
-
-        t_class = sel["title"].get("class") or ""
-        title_elem = article.select_one(f"{sel['title']['tag']}.{t_class}") if t_class else article.select_one(sel["title"]["tag"])
-        title = title_elem.get_text(strip=True) if title_elem else "N/A"
-        image_elem = article.find(sel["image"]["tag"]) if sel.get("image") else None
+        
+        title = safe_find_text(article, sel["title"]["tag"], class_=sel["title"]["class"]) or "N/A"
+        image_elem = article.find(sel["image"]["tag"])
         image_url = validate_url_safety(safe_get_attr(image_elem, 'src'))
-        # content may use attribute selectors
-        content_attrs = sel["content"].get("attrs") if sel.get("content") else None
-        if content_attrs:
-            # take first attribute
-            k, v = next(iter(content_attrs.items()))
-            content_elem = article.select_one(f"{sel['content']['tag']}[{k}='{v}']")
-        else:
-            content_elem = article.select_one(sel["content"]["tag"]) if sel.get("content") else None
-        content = content_elem.get_text(strip=True) if content_elem else ""
-        raw_text = article.get_text(separator=" ", strip=True)
-        registration_url = extract_registration_url_from_text(content, raw_text, str(article))
+        content = safe_find_text(article, sel["content"]["tag"], attrs=sel["content"]["attrs"]) or ""
         
         return NewsItem(
             title=title,
             content=content,
             image_url=image_url,
-            registration_url=registration_url,
             source_url=str(source_url),
             social_posts=None
         )
@@ -464,32 +416,24 @@ def parse_tmit_news(html_content: str, source_url: str) -> Optional[NewsItem]:
 def parse_vik_news(html_content: str, source_url: str) -> Optional[NewsItem]:
     """VIK (news-title-important) típusú hír parsése"""
     try:
+        soup = BeautifulSoup(html_content, features="html.parser", from_encoding="utf-8")
         sel = HTML_SELECTORS["vik"]
-        if isinstance(html_content, Tag):
-            container = html_content
-        else:
-            container = make_soup(html_content)
-
-        t_class = sel["title"].get("class") or ""
-        title_elem = container.select_one(f"{sel['title']['tag']}.{t_class}") if t_class else container.select_one(sel["title"]["tag"])
+        
+        title_elem = soup.find(sel["title"]["tag"], class_=sel["title"]["class"])
         if not title_elem:
             logger.debug("VIK title not found")
             return None
-
+        
         title = title_elem.get_text(strip=True) or "N/A"
-        publish_date = safe_find_text(container, sel["date"]["tag"], class_name=sel["date"].get("class"))
-        content = safe_find_text(container, sel["excerpt"]["tag"], class_name=sel["excerpt"].get("class")) or ""
-        i_class = sel["image"].get("class") if sel.get("image") else None
-        image_elem = container.select_one(f"{sel['image']['tag']}.{i_class}") if i_class else container.select_one(sel["image"]["tag"]) if sel.get("image") else None
+        publish_date = safe_find_text(soup, sel["date"]["tag"], class_=sel["date"]["class"])
+        content = safe_find_text(soup, sel["excerpt"]["tag"], class_=sel["excerpt"]["class"]) or ""
+        image_elem = soup.find(sel["image"]["tag"], class_=sel["image"]["class"])
         image_url = validate_url_safety(safe_get_attr(image_elem, 'src'))
-        raw_text = container.get_text(separator=" ", strip=True)
-        registration_url = extract_registration_url_from_text(content, raw_text, str(container))
         
         return NewsItem(
             title=title,
             content=content,
             image_url=image_url,
-            registration_url=registration_url,
             source_url=str(source_url),
             publish_date=publish_date,
             social_posts=None
@@ -501,30 +445,24 @@ def parse_vik_news(html_content: str, source_url: str) -> Optional[NewsItem]:
 def parse_bme_news(html_content: str, source_url: str) -> Optional[NewsItem]:
     """BME (bme_news_card) típusú hír parsése"""
     try:
+        soup = BeautifulSoup(html_content, features="html.parser", from_encoding="utf-8")
         sel = HTML_SELECTORS["bme_news"]
-        if isinstance(html_content, Tag):
-            news_card = html_content
-        else:
-            container = make_soup(html_content)
-            c_class = sel["card"].get("class") or ""
-            news_card = container.select_one(f"{sel['card']['tag']}.{c_class}") if c_class else container.select_one(sel["card"]["tag"])
+        
+        news_card = soup.find(sel["card"]["tag"], class_=sel["card"]["class"])
         if not news_card:
             logger.debug("BME news card not found")
             return None
         
-        title = safe_find_text(news_card, sel["title"]["tag"], class_name=sel["title"].get("class")) or "N/A"
-        publish_date = safe_find_text(news_card, sel["date"]["tag"], class_name=sel["date"].get("class"))
-        content = safe_find_text(news_card, sel["body"]["tag"], class_name=sel["body"].get("class")) or ""
+        title = safe_find_text(news_card, sel["title"]["tag"], class_=sel["title"]["class"]) or "N/A"
+        publish_date = safe_find_text(news_card, sel["date"]["tag"], class_=sel["date"]["class"])
+        content = safe_find_text(news_card, sel["body"]["tag"], class_=sel["body"]["class"]) or ""
         image_elem = news_card.find(sel["image"]["tag"])
         image_url = validate_url_safety(safe_get_attr(image_elem, 'src'))
-        raw_text = news_card.get_text(separator=" ", strip=True)
-        registration_url = extract_registration_url_from_text(content, raw_text, str(news_card))
         
         return NewsItem(
             title=title,
             content=content,
             image_url=image_url,
-            registration_url=registration_url,
             source_url=str(source_url),
             publish_date=publish_date,
             social_posts=None
@@ -536,48 +474,30 @@ def parse_bme_news(html_content: str, source_url: str) -> Optional[NewsItem]:
 def parse_bme_event(html_content: str, source_url: str) -> Optional[EventDetected]:
     """BME event card parsése"""
     try:
+        soup = BeautifulSoup(html_content, features="html.parser", from_encoding="utf-8")
         sel = HTML_SELECTORS["bme_event"]
-        if isinstance(html_content, Tag):
-            container = html_content
-        else:
-            container = make_soup(html_content)
-
-        title = safe_find_text(container, sel["title"]["tag"], class_name=sel["title"].get("class")) or "N/A"
-        dc = sel.get("date_container")
-        if dc:
-            dc_class = dc.get("class") or ""
-            date_elem = container.select_one(f"{dc['tag']}.{dc_class}") if dc_class else container.select_one(dc['tag'])
-        else:
-            date_elem = None
-        date_str = safe_find_text(date_elem, sel["date"]["tag"], class_name=sel["date"].get("class")) or ""
-        location = safe_find_text(container, sel["location"]["tag"], class_name=sel["location"].get("class")) or "MISSING"
-        content = safe_find_text(container, sel["body"]["tag"], class_name=sel["body"].get("class")) or "MISSING"
-        raw_text = container.get_text(separator=" ", strip=True)
-
-        # Extract registration link from the visible text / raw HTML source
-        reg_url = extract_registration_url_from_text(content, raw_text, str(container)) or "MISSING"
-        participants = ["MISSING"]
-
-        part_sel = sel.get("participants")
-        if part_sel:
-            p_class = part_sel.get("class") or ""
-            part_elem = container.select_one(f"{part_sel['tag']}.{p_class}") if p_class else container.select_one(part_sel['tag'])
-            if part_elem:
-                text = part_elem.get_text(separator=",", strip=True)
-                participants = [p.strip() for p in text.split(",") if p.strip()] or ["MISSING"]
+        
+        title = safe_find_text(soup, sel["title"]["tag"], class_=sel["title"]["class"]) or "N/A"
+        date_elem = soup.find(sel["date_container"]["tag"], class_=sel["date_container"]["class"])
+        date_str = safe_find_text(date_elem, sel["date"]["tag"], class_=sel["date"]["class"]) or ""
+        location = safe_find_text(soup, sel["location"]["tag"], class_=sel["location"]["class"])
+        content = safe_find_text(soup, sel["body"]["tag"], class_=sel["body"]["class"]) or ""
+        registration_url = extract_registration_url(soup, source_url)
+        guests_list = extract_guests_list(soup)
         
         event_type = detect_event_type(title)
         
         return EventDetected(
             title=title,
             date=parse_date_string(date_str),
-            location=location,
+            location=location or "",
             event_type=event_type,
             content=content,
-            registration_url=reg_url,
+            registration_url=registration_url,
+            guests_list=guests_list,
             source_url=str(source_url),
             social_posts=SocialMediaPosts(),
-            participants=participants
+            participants=guests_list
         )
     except (AttributeError, TypeError, ValueError) as e:
         logger.error(f"Error parsing BME event: {e}")
@@ -586,43 +506,25 @@ def parse_bme_event(html_content: str, source_url: str) -> Optional[EventDetecte
 def parse_simple_event(html_content: str, source_url: str) -> Optional[EventDetected]:
     """Egyszerű event formátum parsése (VIK)"""
     try:
+        soup = BeautifulSoup(html_content, features="html.parser", from_encoding="utf-8")
         sel = HTML_SELECTORS["simple_event"]
-        if isinstance(html_content, Tag):
-            container = html_content
-        else:
-            container = make_soup(html_content)
-
-        date_str = safe_find_text(container, sel["date"]["tag"], class_name=sel["date"].get("class")) or ""
-        title = safe_find_text(container, sel["title"]["tag"], class_name=sel["title"].get("class")) or "N/A"
-
-        # registration and participants
-        reg_url = "MISSING"
-        participants = ["MISSING"]
-        reg_sel = sel.get("registration")
-        if reg_sel:
-            r_class = reg_sel.get("class") or ""
-            reg_elem = container.select_one(f"{reg_sel['tag']}.{r_class}") if r_class else container.select_one(reg_sel['tag'])
-            reg_href = safe_get_attr(reg_elem, "href") if reg_elem is not None else None
-            reg_url = validate_url_safety(reg_href) or "MISSING"
-
-        part_sel = sel.get("participants")
-        if part_sel:
-            p_class = part_sel.get("class") or ""
-            part_elem = container.select_one(f"{part_sel['tag']}.{p_class}") if p_class else container.select_one(part_sel['tag'])
-            if part_elem:
-                text = part_elem.get_text(separator=",", strip=True)
-                participants = [p.strip() for p in text.split(",") if p.strip()] or ["MISSING"]
-
+        
+        date_str = safe_find_text(soup, sel["date"]["tag"], class_=sel["date"]["class"]) or ""
+        title = safe_find_text(soup, sel["title"]["tag"], class_=sel["title"]["class"]) or "N/A"
+        registration_url = extract_registration_url(soup, source_url)
+        guests_list = extract_guests_list(soup)
+        
         return EventDetected(
             title=title,
             date=parse_date_string(date_str),
-            location="MISSING",
+            location="",
             event_type=EventType.OTHER,
-            content="MISSING",
-            registration_url=reg_url,
+            content="",
+            registration_url=registration_url,
+            guests_list=guests_list,
             source_url=str(source_url),
             social_posts=SocialMediaPosts(),
-            participants=participants
+            participants=guests_list
         )
     except (AttributeError, TypeError, ValueError) as e:
         logger.error(f"Error parsing simple event: {e}")
@@ -747,7 +649,7 @@ async def parse_html_and_extract_news(html_content: str, source_url: str) -> Dic
                 "error": "Source URL szükséges"
             }
         
-        soup = make_soup(html_content)
+        soup = BeautifulSoup(html_content, features="html.parser", from_encoding="utf-8")
         
         # Extract news and events using helper functions
         tmit_news = _extract_tmit_news(soup, source_url)
@@ -788,6 +690,81 @@ async def parse_html_and_extract_news(html_content: str, source_url: str) -> Dic
             "events_items": [],
             "news_count": 0,
             "event_count": 0
+        }
+
+@mcp.tool()
+async def detect_events_from_content(content: str, current_date: Optional[str] = None) -> Dict[str, Any]:
+    """
+    LLM segítségével részletesebb eseményadatok detektálása szövegből.
+    
+    Kimenete: JSON lista EventDetected sémával.
+    
+    Raises:
+    - ValueError: Ha input nem megfelelő
+    """
+    try:
+        # Input validation
+        if not content or not isinstance(content, str):
+            logger.warning("Invalid content for event detection")
+            raise ValueError("Content must be non-empty string")
+        
+        if not current_date:
+            current_date = _format_human_date(datetime.now())
+        else:
+            # Validate ISO format if provided
+            try:
+                parse_date_string(current_date)
+            except ValueError as e:
+                logger.warning(f"Invalid date format: {current_date}")
+                raise ValueError(f"Invalid date format: {str(e)}")
+        
+        # Regex alapú detektálás
+        try:
+            dates_found = []
+            for year_str, month_name, day_str in REGEX_HUMAN_DATE.findall(content):
+                month_number = _month_name_to_number(month_name)
+                if month_number:
+                    formatted_date = _build_human_date_string(int(year_str), month_number, int(day_str))
+                    if formatted_date:
+                        dates_found.append(formatted_date)
+
+            for year_str, month_str, day_str in REGEX_HUNGARIAN_DATE.findall(content):
+                formatted_date = _build_human_date_string(int(year_str), int(month_str), int(day_str))
+                if formatted_date:
+                    dates_found.append(formatted_date)
+
+            # Preserve order while removing duplicates
+            dates_found = list(dict.fromkeys(dates_found))
+            locations_found = re.findall(REGEX_LOCATION.pattern, content)
+            
+            logger.info(f"Found {len(dates_found)} dates and {len(locations_found)} locations")
+            
+            return {
+                "status": "success",
+                "dates_found": dates_found[:10],  # Limit to 10
+                "locations_found": locations_found[:10],  # Limit to 10
+                "message": "Content processed. Use with LLM for full event extraction.",
+                "current_date": current_date
+            }
+        except re.error as e:
+            logger.error(f"Regex error in event detection: {e}")
+            raise ValueError(f"Regex parsing error: {str(e)}")
+    
+    except ValueError as e:
+        logger.error(f"Validation error in detect_events_from_content: {e}")
+        return {
+            "status": "error",
+            "error": f"Validation error: {str(e)}",
+            "dates_found": [],
+            "locations_found": []
+        }
+    except Exception as e:
+        logger.exception(f"Unexpected error in detect_events_from_content: {e}")
+        return {
+            "status": "error",
+            "error": f"Unexpected error: {str(e)}",
+            "dates_found": [],
+            "locations_found": []
         }
 
 @mcp.tool()
@@ -834,10 +811,6 @@ async def generate_social_posts(
         
         if not events:
             events = []
-
-        news_registration_url = extract_registration_url_from_text(news_content, news_title)
-        event_registration_url = events[0].get("registration_url") if events else None
-        resolved_registration_url = validate_url_safety(event_registration_url or news_registration_url)
         
         # Validate platform names
         valid_platforms = {p.value for p in PlatformType}
@@ -846,16 +819,35 @@ async def generate_social_posts(
                 logger.warning(f"Invalid platform: {platform}")
                 raise ValueError(f"Invalid platform: {platform}")
         
-        # Fill templates from SOCIAL_TEMPLATES
-        templates = {}
-        for key, val in SOCIAL_TEMPLATES.items():
-            if isinstance(val, dict):
-                templates[key] = {k: v.format(title=news_title, content=news_content, url=validated_source_url) for k, v in val.items()}
-            else:
-                if key == "x":
-                    templates[key] = val.format(title=news_title, content=news_content, content_slice=news_content[:200], url=validated_source_url)
-                else:
-                    templates[key] = val.format(title=news_title, content=news_content, url=validated_source_url)
+        # Alapértelmezett template-ek a posztokhoz
+        templates = {
+            "facebook": f"""
+Kedves közösség! 🎓
+
+{news_title}
+
+{news_content}
+
+Tudj meg többet: {validated_source_url}
+""",
+            "linkedin": f"""
+{news_title}
+
+{news_content}
+
+📌 Tudj meg többet:
+{validated_source_url}
+
+#BME #Hírek #Oktatás
+""",
+            "x": f"{news_title}\n\n{news_content[:200]}...\n\n{validated_source_url}",
+            "instagram": f"{news_title}\n.\n{news_content}\n\n#BME #Egyetem #Hírek",
+            "discord": {
+                "title": news_title,
+                "description": news_content,
+                "url": validated_source_url
+            }
+        }
         
         result = {}
         
@@ -864,8 +856,8 @@ async def generate_social_posts(
                 result["facebook"] = {
                     "content": templates["facebook"][:FACEBOOK_MAX_LENGTH],
                     "hashtags": ["#BME", "#Hírek"],
-                    "cta_button": "Tudj meg többet" if resolved_registration_url else None,
-                    "cta_url": resolved_registration_url
+                    "cta_button": "Tudj meg többet" if events else None,
+                    "cta_url": events[0].get("registration_url") if events else None
                 }
             
             if "linkedin" in platforms:
@@ -874,7 +866,7 @@ async def generate_social_posts(
                     "body": templates["linkedin"],
                     "hashtags": ["BME", "Hírek", "Oktatás"],
                     "cta_text": "Regisztrálj",
-                    "cta_url": resolved_registration_url or validated_source_url
+                    "cta_url": events[0].get("registration_url") if events else validated_source_url
                 }
             
             if "x" in platforms:
@@ -931,6 +923,102 @@ async def generate_social_posts(
             "posts": {},
             "platforms_generated": [],
             "event_count": 0
+        }
+
+@mcp.tool()
+async def enrich_with_registration_link(
+    post: Dict[str, Any],
+    event: Dict[str, Any],
+    platform: str
+) -> Dict[str, Any]:
+    """
+    Regisztrációs link injektálása az eseményt tartalmazó posztokba.
+    
+    Raises:
+    - ValueError: Ha input nem megfelelő
+    """
+    try:
+        if not post or not isinstance(post, dict):
+            logger.warning("Invalid post object for enrichment")
+            raise ValueError("Post objektum szükséges")
+        
+        if not event or not isinstance(event, dict):
+            logger.warning("Invalid event object for enrichment")
+            raise ValueError("Event objektum szükséges")
+        
+        if not platform or platform not in [p.value for p in PlatformType]:
+            logger.warning(f"Invalid platform: {platform}")
+            raise ValueError(f"Érvénytelen platform: {platform}")
+        
+        registration_url = event.get("registration_url") or event.get("source_url")
+        
+        if not registration_url:
+            logger.info("No registration URL found for event enrichment")
+            return {
+                "status": "warning",
+                "message": "No registration URL found",
+                "enriched_post": post
+            }
+        
+        # Sanitize URL
+        registration_url = validate_url_safety(registration_url)
+        if not registration_url:
+            logger.warning("Registration URL failed validation")
+            return {
+                "status": "warning",
+                "message": "Registration URL failed validation",
+                "enriched_post": post
+            }
+        
+        enriched = post.copy()
+        event_title = event.get("title", "").strip()
+        event_date = event.get("date", "").strip()
+        
+        if platform == PlatformType.FACEBOOK.value:
+            enriched["content"] += f"\n\n📅 {event_title} ({event_date})\n🔗 Regisztrálj: {registration_url}"
+        
+        elif platform == PlatformType.LINKEDIN.value:
+            enriched["body"] += f"\n\n🎯 {event_title}\n🗓️ {event_date}\n\n👉 {registration_url}"
+        
+        elif platform == PlatformType.X.value:
+            enriched["content"] = enriched.get("content", "")[:250] + f"\n🔗 {registration_url}"
+        
+        elif platform == PlatformType.INSTAGRAM.value:
+            enriched["caption"] = enriched.get("caption", "") + f"\n\n📌 {event_title}\n{registration_url}"
+        
+        elif platform == PlatformType.DISCORD.value:
+            if "embed_fields" not in enriched:
+                enriched["embed_fields"] = {}
+            enriched["embed_fields"]["Regisztráció"] = registration_url
+            enriched["embed_fields"]["Dátum"] = event_date
+        
+        logger.info(f"Successfully enriched post for {platform}")
+        return {
+            "status": "success",
+            "enriched_post": enriched,
+            "platform": platform
+        }
+    
+    except ValueError as e:
+        logger.error(f"Validation error in enrich_with_registration_link: {e}")
+        return {
+            "status": "error",
+            "error": f"Validation error: {str(e)}",
+            "enriched_post": post
+        }
+    except KeyError as e:
+        logger.error(f"Missing key in enrich_with_registration_link: {e}")
+        return {
+            "status": "error",
+            "error": f"Missing required field: {str(e)}",
+            "enriched_post": post
+        }
+    except Exception as e:
+        logger.exception(f"Unexpected error in enrich_with_registration_link: {e}")
+        return {
+            "status": "error",
+            "error": f"Unexpected error: {str(e)}",
+            "enriched_post": post
         }
 
 # ============================================================================
