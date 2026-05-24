@@ -32,21 +32,18 @@ logging.basicConfig(
 logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("doom")
 
-from dataclasses import replace
-
 from pydantic_ai import Agent, ModelRequestContext, ModelResponse, RunContext, UsageLimits
 from pydantic_ai.exceptions import UsageLimitExceeded, ModelHTTPError
 from pydantic_ai.models.ollama import OllamaModel
 from pydantic_ai.providers.ollama import OllamaProvider
-from pydantic_ai.models.openai import OpenAIChatModel
-from pydantic_ai.providers.openai import OpenAIProvider
-from pydantic_ai.mcp import MCPToolset
+from pydantic_ai.toolsets.fastmcp import FastMCPToolset as MCPToolset
 from pydantic_ai.capabilities import Hooks, ValidatedToolArgs
 from pydantic_ai.messages import (
     TextPart, ThinkingPart, ToolCallPart,
     ToolReturnPart, RetryPromptPart, UserPromptPart,
 )
 from pydantic_ai.tools import ToolDefinition
+from mcp.shared.exceptions import McpError
 
 hooks = Hooks()
 
@@ -105,11 +102,19 @@ if os.getenv("ENABLE_SSH_TUNNEL", "0") == "1":
         log.warning("SSH tunnel startup failed; continuing without it: %s", exc)
 # Use Ollama by default. Ollama should be running locally or reachable via OLLAMA_BASE_URL.
 # Adjust model name to one available in your Ollama instance via OLLAMA_MODEL.
-# Example models present locally: 'qwen3.5:2b-q4_K_M', 'qwen3.5:cloud', 'qwen3-coder-next:cloud'.
 ollama_provider = OllamaProvider(
     base_url=os.getenv('OLLAMA_BASE_URL', "http://localhost:11434/v1"),
 )
-model = OllamaModel(os.getenv('OLLAMA_MODEL', 'qwen3-coder-next:cloud'), provider=ollama_provider)
+ollama_model_name = os.getenv('OLLAMA_MODEL')
+if not ollama_model_name:
+    raise RuntimeError("OLLAMA_MODEL must be set to the Ollama model name to use.")
+
+
+def _create_model(model_name: str) -> OllamaModel:
+    return OllamaModel(model_name, provider=ollama_provider)
+
+
+model = _create_model(ollama_model_name)
 
 # Print connection info (avoid calling functions not yet defined)
 _doom_port = os.getenv("DOOM_MCP_PORT", "8001")
@@ -119,7 +124,7 @@ _mem_url = os.getenv("MEMORY_MCP_URL", f"http://localhost:{_mem_port}/sse")
 log.info("DOOM_MCP_URL=%s", _doom_url)
 log.info("MEMORY_MCP_URL=%s", _mem_url)
 log.info("OLLAMA_BASE_URL=%s", os.getenv('OLLAMA_BASE_URL', 'not set'))
-log.info("OLLAMA_MODEL=%s", os.getenv('OLLAMA_MODEL', 'not set'))
+log.info("OLLAMA_MODEL=%s", ollama_model_name)
 
 
 def _server_url() -> str:
@@ -275,27 +280,16 @@ def ensure_memory_mcp_server(url: str | None = None) -> None:
         f"Memory MCP server did not become ready at {target_url}.\n"
         f"Backend stderr:\n{_tail_text(stderr_output)}"
     )
-
-
-
-'''
-provider = "OpenAI"
-if provider == "OpenAI":
-    model = OpenAIChatModel('gpt-5.4-mini')
-else:
-    _provider = OllamaProvider(base_url='http://localhost:11434/v1')
-    _profile = replace(_provider.model_profile('gemma4:latest'), openai_chat_send_back_thinking_parts='tags')
-    model = OllamaModel('gemma4:latest', provider=_provider, profile=_profile)
-'''
-
 INSTRUCTIONS = """
 You are an autonomous Doom player controlled turn-by-turn by a commander.
 Each turn you receive ONE objective. Execute it with the minimum tool calls needed, then stop and report.
 You MUST use your tools — do not describe actions, execute them.
+Prefer compound tools that complete a task in one call: `move_to`, `aim_and_shoot`, `strafe_and_shoot`, `explore`, `retreat`.
+Avoid chaining many tiny movement or turning actions when one higher-level tool can finish the objective.
 
 ## Startup
-If no game is running, start a new Doom II game on MAP02 with difficulty 3 and a visible window if available.
-Call `start_game` alone and wait for it to finish before doing anything else.
+If no game is running, start a new game by calling `start_game(wad="freedoom2", map_name="MAP02", difficulty=3, async_player=True, window_visible=True)`.
+Call `start_game` alone with exactly those parameter names and wait for it to finish before doing anything else.
 Do not call `start_game` again unless the game crashes.
 
 ## One task per turn
@@ -315,6 +309,7 @@ Stop after completing the task. Do not keep exploring or fighting after the obje
 - `strafe_and_shoot` is for hitscan enemies such as chaingunners and former humans.
 - `aim_and_shoot` is for other enemies.
 - `retreat` moves away when health is critical.
+When you must adjust aim or heading, make one decisive turn instead of a long sequence of small left/right corrections.
 
 ## Doors and keys
 Doom doors are opened by walking up and using them. Keys unlock color-coded locked doors.
@@ -330,6 +325,10 @@ Doom doors are opened by walking up and using them. Keys unlock color-coded lock
 - Scan `get_objects` for names containing exit, switch, or teleport.
 - Call `move_to` with use enabled to finish the level.
 - When `episode_finished` is true in any result, call `new_episode` to advance to the next map.
+
+## Interrupted movement
+- If `move_to` is interrupted by `enemy_nearby`, treat it as temporary.
+- Clear the threat, then resume the same `move_to` objective until the target is reached or lost.
 
 ## Rules
 - Always call exactly one tool or a short tool sequence per turn.
@@ -370,6 +369,7 @@ No enemies, healthy: direct the player to explore for enemies.
 Exit or switch found: direct move_to to activate it.
 - Stuck / max_tics: direct get_navigation_info then explore in a different direction.
 - episode_finished seen: direct new_episode immediately.
+- If the player reports `enemy_nearby` during `move_to`, reissue the same `move_to` objective after the threat is cleared instead of switching to generic exploration.
 
 ## How to give instructions
 Respond in exactly this format:
@@ -398,18 +398,26 @@ ensure_doom_mcp_server()
 doom_mcp = MCPToolset(_server_url(), max_retries=3)
 ensure_memory_mcp_server()
 memory_mcp = MCPToolset(os.getenv("MEMORY_MCP_URL", "http://localhost:8002/sse"), max_retries=3)
-doom_player = Agent(
-    model,
-    instructions=INSTRUCTIONS,
-    toolsets=[doom_mcp, memory_mcp],
-    capabilities=[hooks],
-)
 
-commander = Agent(
-    model,
-    instructions=COMMANDER_INSTRUCTIONS,
-    capabilities=[hooks],
-)
+
+def _create_agents() -> tuple[MCPToolset, MCPToolset, Agent, Agent]:
+    doom_toolset = MCPToolset(_server_url(), max_retries=3)
+    memory_toolset = MCPToolset(os.getenv("MEMORY_MCP_URL", "http://localhost:8002/sse"), max_retries=3)
+    player = Agent(
+        model,
+        instructions=INSTRUCTIONS,
+        toolsets=[doom_toolset, memory_toolset],
+        capabilities=[hooks],
+    )
+    commander_agent = Agent(
+        model,
+        instructions=COMMANDER_INSTRUCTIONS,
+        capabilities=[hooks],
+    )
+    return doom_toolset, memory_toolset, player, commander_agent
+
+
+doom_mcp, memory_mcp, doom_player, commander = _create_agents()
 
 PLAYER_LIMITS = UsageLimits(request_limit=20)
 COMMANDER_LIMITS = UsageLimits(request_limit=10)
@@ -422,10 +430,22 @@ async def main():
     commander_history = []
     player_output = ""
 
+    async def run_player(prompt: str):
+        global doom_mcp, memory_mcp, doom_player
+        try:
+            return await doom_player.run(prompt, usage_limits=PLAYER_LIMITS)
+        except ModelHTTPError as exc:
+            if "429" in str(exc):
+                await _handle_model_http_error(exc)
+            raise
+        except McpError as exc:
+            log.warning("MCP connection lost; rebuilding toolsets once: %s", exc)
+            doom_mcp, memory_mcp, doom_player, _ = _create_agents()
+            return await doom_player.run(prompt, usage_limits=PLAYER_LIMITS)
+
     try:
-        result = await doom_player.run(
-            'Start the game and begin play.',
-            usage_limits=PLAYER_LIMITS,
+        result = await run_player(
+            'Start the game by calling start_game(wad="freedoom2", map_name="MAP02", difficulty=3, async_player=True, window_visible=True). Then begin play using compound tools.',
         )
         player_output = result.output or ""
     except UsageLimitExceeded as e:
@@ -449,9 +469,8 @@ async def main():
         console.print(_panel(commander_output, "[bold magenta]COMMANDER[/bold magenta]", "magenta"))
 
         try:
-            result = await doom_player.run(
+            result = await run_player(
                 f'Commander instruction: {commander_output}',
-                usage_limits=PLAYER_LIMITS,
             )
             player_output = result.output or ""
         except UsageLimitExceeded as e:
@@ -465,54 +484,15 @@ async def main():
 
 
 async def _handle_model_http_error(err: Exception) -> None:
-    """Attempt to stop the running game, print the error, and exit.
+    """Print the error and exit immediately.
 
-    This tries a few fallback ways to invoke the `stop_game` tool on the
-    Doom MCP server. If all attempts fail, the error is still printed and
-    the process exits so the operator can intervene.
+    A model-side 429 means the session cannot continue, so we stop the bot
+    cleanly without retrying the model or attempting extra recovery calls.
     """
     err_msg = f"Model HTTP error / rate limit: {err}"
     log.error(err_msg)
     console.print(Panel(err_msg, title="[red]MODEL ERROR[/red]", border_style="red"))
-
-    # Try toolset-level calls (best-effort; different fastmcp client versions vary)
-    try:
-        if hasattr(doom_mcp, "call_tool"):
-            maybe = doom_mcp.call_tool("stop_game")
-            if asyncio.iscoroutine(maybe):
-                await maybe
-            log.info("Requested stop_game via doom_mcp.call_tool")
-            return
-        if hasattr(doom_mcp, "call_tool_sync"):
-            try:
-                doom_mcp.call_tool_sync("stop_game")
-                log.info("Requested stop_game via doom_mcp.call_tool_sync")
-                return
-            except Exception:
-                pass
-        # Some toolset proxies expose tools as attributes
-        if hasattr(doom_mcp, "stop_game") and callable(getattr(doom_mcp, "stop_game")):
-            maybe = getattr(doom_mcp, "stop_game")()
-            if asyncio.iscoroutine(maybe):
-                await maybe
-            log.info("Requested stop_game via doom_mcp.stop_game attribute")
-            return
-    except Exception as exc:
-        log.warning("Best-effort stop_game attempt failed: %s", exc)
-
-    # Last resort: try a simple HTTP POST to an endpoint (best-guess)
-    try:
-        srv = _server_url().replace("/sse", "")
-        url = f"{srv}/tools/stop_game"
-        req = urllib.request.Request(url, data=b"{}", headers={"Content-Type": "application/json"}, method="POST")
-        urllib.request.urlopen(req, timeout=2)
-        log.info("Requested stop_game via HTTP POST %s", url)
-        return
-    except Exception as exc:
-        log.warning("HTTP stop_game attempt failed: %s", exc)
-
-    # If we couldn't stop programmatically, still exit so operator can intervene
-    log.error("Could not automatically stop the game. Please stop the Doom process manually.")
+    log.error("Stopping now; no fallback or recovery will be attempted.")
     sys.exit(1)
 
 

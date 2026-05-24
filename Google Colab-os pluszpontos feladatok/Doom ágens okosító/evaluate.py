@@ -94,7 +94,9 @@ def evaluate_with_agent(episodes: int, scenario: str, seed: int, out_path: str, 
     # Attempt to construct an Ollama model; if not available, raise and fallback
     try:
         provider = OllamaProvider(base_url=os.getenv('OLLAMA_BASE_URL', 'http://localhost:11434/v1'))
-        model_name = os.getenv('OLLAMA_MODEL', 'qwen3-coder-next:cloud')
+        model_name = os.getenv('OLLAMA_MODEL')
+        if not model_name:
+            raise RuntimeError('OLLAMA_MODEL must be set to the Ollama model name to use.')
         model = OllamaModel(model_name, provider=provider)
     except Exception as e:
         raise RuntimeError(f"Could not initialize Ollama model: {e}")
