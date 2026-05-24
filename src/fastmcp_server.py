@@ -4,7 +4,7 @@ import logging
 import os
 import re
 import unicodedata
-from datetime import datetime
+# datetime not used; previously imported but removed
 from typing import Iterable
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlparse
@@ -83,8 +83,17 @@ class News(BaseModel):
 	title: str
 	date: str
 	content: str
-	topics: list[str] = Field(default_factory=list)
 	url: str
+
+
+class Event(BaseModel):
+	event_title: str
+	event_date: str
+	event_location: str | None = None
+	event_description: str | None = None
+	event_guests_list: list[str] = Field(default_factory=list)
+	event_registration_url: str | None = None
+	event_url: str
 
 
 mcp = FastMCP("BME News")
@@ -102,10 +111,25 @@ def _clean_text(text: str | None) -> str:
 
 
 def _normalize_url(raw_url: str) -> str:
+	"""Validate and slightly canonicalize a URL.
+
+	Returns a normalized URL string using lowercased scheme/netloc and
+	a trimmed path (no trailing slash except root). Raises ValueError
+	for unsupported schemes or missing netloc.
+	"""
 	parsed = urlparse(raw_url)
 	if parsed.scheme not in {"http", "https"} or not parsed.netloc:
 		raise ValueError(f"Unsupported URL: {raw_url}")
-	return raw_url
+
+	scheme = parsed.scheme.lower()
+	netloc = parsed.netloc.lower()
+	# trim trailing slash from path for normalization (but keep single /)
+	path = parsed.path
+	if path and path != "/":
+		path = path.rstrip("/")
+
+	normalized = parsed._replace(scheme=scheme, netloc=netloc, path=path).geturl()
+	return normalized
 
 
 def _canonical_month_name(month_number: int) -> str:
@@ -239,58 +263,7 @@ def _extract_page_date(soup: BeautifulSoup) -> str:
 	return ""
 
 
-def _extract_topics(soup: BeautifulSoup, title: str, content: str, url: str) -> list[str]:
-	topics: list[str] = []
 
-	meta_keywords = _extract_meta_content(
-		soup,
-		[
-			"meta[name='keywords']",
-			"meta[name='news_keywords']",
-			"meta[property='article:tag']",
-		],
-	)
-	if meta_keywords:
-		for token in re.split(r"[;,/|]", meta_keywords):
-			cleaned = _clean_text(token)
-			if cleaned and cleaned not in topics:
-				topics.append(cleaned)
-
-	breadcrumb_text = " ".join(
-		_clean_text(node.get_text(" ", strip=True))
-		for node in soup.select("nav.breadcrumb, .breadcrumb, .breadcrumbs, .path")
-		if _clean_text(node.get_text(" ", strip=True))
-	)
-	if breadcrumb_text:
-		for token in re.split(r"\s{2,}|[>»/|]", breadcrumb_text):
-			cleaned = _clean_text(token)
-			if cleaned and cleaned not in topics:
-				topics.append(cleaned)
-
-	haystack = f"{title} {content} {url}".lower()
-	keyword_map = [
-		("AI", ["mesterséges intelligencia", " ai", "llm", "chatgpt", "robot", "nóra", "nora"]),
-		("Kiberbiztonság", ["kiber", "cyber", "security", "adatvédelem", "ssl"]),
-		("Esemény", ["workshop", "konferencia", "esemény", "event", "rendezv", "előadás", "eloadas"]),
-		("Oktatás", ["hallgat", "felvételi", "záróvizsga", "diploma", "ösztöndíj", "kurzus", "education"]),
-		("Kutatás", ["kutatás", "projekt", "fejleszt", "innováció", "labor", "research"]),
-		("Űrkutatás", ["űr", "urkutatas", "space", "satellite"]),
-		("Mobil", ["mobil", "telefon", "iphone", "android", "app"]),
-		("Energetika", ["energia", "villamos", "emc", "power", "távközl", "telekom"]),
-	]
-	for label, keywords in keyword_map:
-		if any(keyword in haystack for keyword in keywords) and label not in topics:
-			topics.append(label)
-
-	if not topics:
-		if "vik.bme.hu" in url:
-			topics.append("VIK")
-		elif "tmit.bme.hu" in url:
-			topics.append("TMIT")
-		elif "bme.hu" in url:
-			topics.append("BME")
-
-	return topics[:5]
 
 
 def _looks_like_article_link(href: str, base_url: str) -> bool:
@@ -349,7 +322,6 @@ def _parse_article_page(html: str, url: str) -> list[News]:
 			title=title,
 			date=date_text,
 			content=content_text,
-			topics=_extract_topics(soup, title, content_text, url),
 			url=url,
 		)
 	]
@@ -420,7 +392,6 @@ def _parse_listing_page(html: str, url: str) -> list[News]:
 				title=title,
 				date=date_text,
 				content=content_text,
-				topics=_extract_topics(soup, title, content_text, absolute_url),
 				url=absolute_url,
 			)
 		)
@@ -450,7 +421,13 @@ def _parse_news_html(html: str, url: str) -> list[News]:
 def fetch_html(urls: list[str]) -> RawHTML:
 	pages: dict[str, str] = {}
 	for raw_url in urls:
-		url = _normalize_url(raw_url)
+		try:
+			url = _normalize_url(raw_url)
+		except ValueError as exc:
+			logger.warning("Skipping invalid URL %s: %s", raw_url, exc)
+			pages[raw_url] = ""
+			continue
+
 		request = Request(
 			url,
 			headers={
@@ -494,6 +471,137 @@ def get_today_news(urls: list[str], date: str) -> list[News]:
 	seen: set[tuple[str, str, str]] = set()
 	for item in filtered:
 		identity = (item.title, item.date, item.url)
+		if identity in seen:
+			continue
+		seen.add(identity)
+		deduped.append(item)
+	return deduped
+
+
+@mcp.tool()
+def extract_events(html: str, url: str) -> list[Event]:
+	_normalize_url(url)
+	soup = BeautifulSoup(html, "html.parser")
+	events: list[Event] = []
+	seen: set[tuple[str, str]] = set()
+
+	# Candidate containers: elements that often contain event info
+	candidates = soup.find_all(["article", "li", "section", "div"])
+	for container in candidates:
+		classes = " ".join(container.get("class") or [])
+		text = _extract_visible_text(container)
+		if (
+			"event" not in classes.lower()
+			and "vevent" not in classes.lower()
+			and "program" not in classes.lower()
+			and "agenda" not in classes.lower()
+			and not container.select_one("time")
+			and "event" not in container.get_text(" ", strip=True).lower()
+		):
+			continue
+
+		# Title
+		title = ""
+		for sel in ("h1", "h2", "h3", "a", "strong"):
+			el = container.select_one(sel)
+			if el and _clean_text(el.get_text(" ", strip=True)):
+				title = _clean_text(el.get_text(" ", strip=True))
+				break
+		if not title:
+			continue
+
+		# URL
+		anchor = container.find("a", href=True)
+		absolute_url = urljoin(url, anchor.get("href")) if anchor else url
+
+		# Date extraction
+		start_date = ""
+		date_text = ""
+		time_el = container.select_one("time")
+		if time_el:
+			raw = time_el.get("datetime") or time_el.get_text(" ", strip=True)
+			raw = _clean_text(raw)
+			try:
+				if raw:
+					if re.fullmatch(r"\d{4}-\d{2}-\d{2}(?:[T ].*)?", raw):
+						start_date = _canonical_date(int(raw[:4]), int(raw[5:7]), int(raw[8:10]))
+					else:
+						start_date = _normalize_date_string(raw)
+					date_text = raw
+			except ValueError:
+				start_date = ""
+
+		if not start_date:
+			# try to find date-like text in container
+			for pattern in (
+				re.search(r"\d{4}[./\- ]+[A-Za-zÁÉÍÓÖŐÚÜŰáéíóöőúüű]+[./\- ]+\d{1,2}", text),
+				re.search(r"\d{4}[./\- ]+\d{1,2}[./\- ]+\d{1,2}", text),
+				re.search(r"[A-Za-zÁÉÍÓÖŐÚÜŰáéíóöőúüű]+\s+\d{1,2},?\s+20\d{2}", text),
+			):
+				if pattern:
+					try:
+						start_date = _normalize_date_string(pattern.group(0))
+						date_text = pattern.group(0)
+						break
+					except ValueError:
+						continue
+
+		# Location and description
+		location = ""
+		for sel in (".location", ".venue", ".place", ".helyszin", ".helysz%C3%ADn"):
+			el = container.select_one(sel)
+			if el:
+				location = _clean_text(el.get_text(" ", strip=True))
+				break
+
+		description = _find_summary_text(container, title, date_text) or None
+
+		# try to find a registration link inside the container
+		reg_url = None
+		for a in container.find_all("a", href=True):
+			href = a.get("href") or ""
+			text = _clean_text(a.get_text(" ", strip=True)).lower()
+			if any(tok in href.lower() for tok in ("register", "regisztr", "jelent", "apply", "signup")) or any(tok in text for tok in ("regisztr", "jelent", "register", "sign up", "apply")):
+				reg_url = urljoin(url, href)
+				break
+
+		event = Event(
+			event_title=title,
+			event_date=start_date or "",
+			event_location=location or None,
+			event_description=description,
+			event_guests_list=[],
+			event_registration_url=reg_url,
+			event_url=absolute_url,
+		)
+
+		identity = (event.title, event.start_date)
+		if identity in seen:
+			continue
+		seen.add(identity)
+		events.append(event)
+
+	return events
+
+
+@mcp.tool()
+def filter_events_by_date(events: list[Event], date: str) -> list[Event]:
+	target = _normalize_date_string(date)
+	return [e for e in events if e.event_date == target]
+
+
+@mcp.tool()
+def get_today_events(urls: list[str], date: str) -> list[Event]:
+	fetched = fetch_html(urls)
+	parsed: list[Event] = []
+	for source_url, html in fetched.pages.items():
+		parsed.extend(extract_events(html, source_url))
+
+	filtered = filter_events_by_date(parsed, date)
+	deduped: list[Event] = []
+	seen: set[tuple[str, str]] = set()
+	for item in filtered:
+		identity = (item.event_title, item.event_date)
 		if identity in seen:
 			continue
 		seen.add(identity)
