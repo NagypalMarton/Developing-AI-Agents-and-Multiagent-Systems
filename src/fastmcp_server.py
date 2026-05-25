@@ -90,9 +90,9 @@ class Event(BaseModel):
 	event_title: str
 	event_date: str
 	event_location: str | None = None
-	event_description: str | None = None
+	event_description: str
 	event_guests_list: list[str] = Field(default_factory=list)
-	event_registration_url: str | None = None
+	event_registration_url: str
 	event_url: str
 
 
@@ -454,9 +454,14 @@ def parse_news(html: str, url: str) -> list[News]:
 
 
 @mcp.tool()
-def filter_news_by_date(news: list[News], date: str) -> list[News]:
+def filter_news_by_date(news: list[News] | list[Event], date: str) -> list[News] | list[Event]:
 	target_date = _normalize_date_string(date)
-	return [item for item in news if item.date == target_date]
+	filtered: list[News | Event] = []
+	for item in news:
+		item_date = item.date if isinstance(item, News) else item.event_date
+		if item_date == target_date:
+			filtered.append(item)
+	return filtered
 
 
 @mcp.tool()
@@ -478,8 +483,7 @@ def get_today_news(urls: list[str], date: str) -> list[News]:
 	return deduped
 
 
-@mcp.tool()
-def extract_events(html: str, url: str) -> list[Event]:
+def _parse_events_html(html: str, url: str) -> list[Event]:
 	_normalize_url(url)
 	soup = BeautifulSoup(html, "html.parser")
 	events: list[Event] = []
@@ -548,16 +552,16 @@ def extract_events(html: str, url: str) -> list[Event]:
 
 		# Location and description
 		location = ""
-		for sel in (".location", ".venue", ".place", ".helyszin", ".helysz%C3%ADn"):
+		for sel in (".location", ".venue", ".place", ".helyszin", "[class*='helysz']"):
 			el = container.select_one(sel)
 			if el:
 				location = _clean_text(el.get_text(" ", strip=True))
 				break
 
-		description = _find_summary_text(container, title, date_text) or None
+		description = _find_summary_text(container, title, date_text) or ""
 
 		# try to find a registration link inside the container
-		reg_url = None
+		reg_url = ""
 		for a in container.find_all("a", href=True):
 			href = a.get("href") or ""
 			text = _clean_text(a.get_text(" ", strip=True)).lower()
@@ -575,7 +579,7 @@ def extract_events(html: str, url: str) -> list[Event]:
 			event_url=absolute_url,
 		)
 
-		identity = (event.title, event.start_date)
+		identity = (event.event_title, event.event_date)
 		if identity in seen:
 			continue
 		seen.add(identity)
@@ -585,9 +589,14 @@ def extract_events(html: str, url: str) -> list[Event]:
 
 
 @mcp.tool()
+def parse_events(html: str, url: str) -> list[Event]:
+	return _parse_events_html(html, url)
+
+
+@mcp.tool()
 def filter_events_by_date(events: list[Event], date: str) -> list[Event]:
-	target = _normalize_date_string(date)
-	return [e for e in events if e.event_date == target]
+	filtered = filter_news_by_date(events, date)
+	return [e for e in filtered if isinstance(e, Event)]
 
 
 @mcp.tool()
@@ -595,9 +604,10 @@ def get_today_events(urls: list[str], date: str) -> list[Event]:
 	fetched = fetch_html(urls)
 	parsed: list[Event] = []
 	for source_url, html in fetched.pages.items():
-		parsed.extend(extract_events(html, source_url))
+		parsed.extend(parse_events(html, source_url))
 
-	filtered = filter_events_by_date(parsed, date)
+	filtered_items = filter_news_by_date(parsed, date)
+	filtered = [item for item in filtered_items if isinstance(item, Event)]
 	deduped: list[Event] = []
 	seen: set[tuple[str, str]] = set()
 	for item in filtered:
