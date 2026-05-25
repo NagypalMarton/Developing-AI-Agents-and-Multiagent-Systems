@@ -4,7 +4,6 @@ import logging
 import os
 import re
 import unicodedata
-# datetime not used; previously imported but removed
 from typing import Iterable
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlparse
@@ -90,9 +89,9 @@ class Event(BaseModel):
 	event_title: str
 	event_date: str
 	event_location: str | None = None
-	event_description: str
+	event_description: str = Field(min_length=1)
 	event_guests_list: list[str] = Field(default_factory=list)
-	event_registration_url: str
+	event_registration_url: str = Field(min_length=1)
 	event_url: str
 
 
@@ -454,14 +453,24 @@ def parse_news(html: str, url: str) -> list[News]:
 
 
 @mcp.tool()
-def filter_news_by_date(news: list[News] | list[Event], date: str) -> list[News] | list[Event]:
+def filter_items_by_date(items: list[News] | list[Event], date: str) -> list[News] | list[Event]:
 	target_date = _normalize_date_string(date)
 	filtered: list[News | Event] = []
-	for item in news:
+	for item in items:
 		item_date = item.date if isinstance(item, News) else item.event_date
 		if item_date == target_date:
 			filtered.append(item)
 	return filtered
+
+
+@mcp.tool()
+def filter_news_by_date(news: list[News], date: str) -> list[News]:
+	"""Deprecated: use filter_items_by_date for unified date filtering.
+
+	Kept for backward compatibility for news-only callers.
+	"""
+	filtered = filter_items_by_date(news, date)
+	return [item for item in filtered if isinstance(item, News)]
 
 
 @mcp.tool()
@@ -558,7 +567,9 @@ def _parse_events_html(html: str, url: str) -> list[Event]:
 				location = _clean_text(el.get_text(" ", strip=True))
 				break
 
-		description = _find_summary_text(container, title, date_text) or ""
+		description = _find_summary_text(container, title, date_text)
+		if not description:
+			continue
 
 		# try to find a registration link inside the container
 		reg_url = ""
@@ -568,6 +579,8 @@ def _parse_events_html(html: str, url: str) -> list[Event]:
 			if any(tok in href.lower() for tok in ("register", "regisztr", "jelent", "apply", "signup")) or any(tok in text for tok in ("regisztr", "jelent", "register", "sign up", "apply")):
 				reg_url = urljoin(url, href)
 				break
+		if not reg_url:
+			continue
 
 		event = Event(
 			event_title=title,
@@ -595,7 +608,11 @@ def parse_events(html: str, url: str) -> list[Event]:
 
 @mcp.tool()
 def filter_events_by_date(events: list[Event], date: str) -> list[Event]:
-	filtered = filter_news_by_date(events, date)
+	"""Deprecated: use filter_items_by_date for unified date filtering.
+
+	Kept for backward compatibility for event-only callers.
+	"""
+	filtered = filter_items_by_date(events, date)
 	return [e for e in filtered if isinstance(e, Event)]
 
 
@@ -606,7 +623,7 @@ def get_today_events(urls: list[str], date: str) -> list[Event]:
 	for source_url, html in fetched.pages.items():
 		parsed.extend(parse_events(html, source_url))
 
-	filtered_items = filter_news_by_date(parsed, date)
+	filtered_items = filter_items_by_date(parsed, date)
 	filtered = [item for item in filtered_items if isinstance(item, Event)]
 	deduped: list[Event] = []
 	seen: set[tuple[str, str]] = set()
