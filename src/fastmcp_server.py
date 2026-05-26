@@ -419,6 +419,15 @@ def _parse_news_html(html: str, url: str) -> list[News]:
 
 @mcp.tool()
 def fetch_html(urls: list[str]) -> RawHTML:
+	"""Download each URL and return the raw HTML response per URL.
+
+	Args:
+		urls: Absolute HTTP/HTTPS URLs to fetch.
+
+	Returns:
+		A RawHTML object whose pages map contains the fetched HTML strings.
+		Failed fetches are stored as empty strings.
+	"""
 	pages: dict[str, str] = {}
 	for raw_url in urls:
 		try:
@@ -449,12 +458,34 @@ def fetch_html(urls: list[str]) -> RawHTML:
 
 @mcp.tool()
 def parse_news(html: str, url: str) -> list[News]:
+	"""Parse a single HTML document into normalized news items.
+
+	Args:
+		html: The HTML document to analyze.
+		url: The source URL used for link resolution and article heuristics.
+
+	Returns:
+		A list of News items extracted from the page. Returns an empty list
+		if the HTML does not look like a news article or listing page.
+	"""
 	_normalize_url(url)
 	return _parse_news_html(html, url)
 
 
 @mcp.tool()
 def filter_items_by_date(items: list[News] | list[Event], date: str) -> list[News | Event]:
+	"""Keep only items whose date matches the requested date.
+
+	The input date is normalized with the server's canonical date parser
+	(e.g. 2026.May.26). This tool works for both News.date and Event.event_date.
+
+	Args:
+		items: A mixed list of News or Event objects.
+		date: Date string in the server's accepted formats.
+
+	Returns:
+		A list containing only items whose canonical date equals the target date.
+	"""
 	target_date = _normalize_date_string(date)
 	filtered: list[News | Event] = []
 	for item in items:
@@ -465,23 +496,22 @@ def filter_items_by_date(items: list[News] | list[Event], date: str) -> list[New
 
 
 @mcp.tool()
-def filter_news_by_date(news: list[News], date: str) -> list[News]:
-	"""Deprecated: use filter_items_by_date for unified date filtering.
-
-	Kept for backward compatibility for news-only callers.
-	"""
-	filtered = filter_items_by_date(news, date)
-	return [item for item in filtered if isinstance(item, News)]
-
-
-@mcp.tool()
 def get_today_news(urls: list[str], date: str) -> list[News]:
+	"""Fetch news pages, parse news items, and return only matching-date news.
+
+	Args:
+		urls: Absolute URLs to fetch and parse as news sources.
+		date: Target date to keep after canonical normalization.
+
+	Returns:
+		Deduplicated News items whose canonical date matches the requested date.
+	"""
 	fetched = fetch_html(urls)
 	parsed_news: list[News] = []
 	for source_url, html in fetched.pages.items():
 		parsed_news.extend(_parse_news_html(html, source_url))
 
-	filtered = filter_news_by_date(parsed_news, date)
+	filtered = filter_items_by_date(parsed_news, date)
 	deduped: list[News] = []
 	seen: set[tuple[str, str, str]] = set()
 	for item in filtered:
@@ -604,21 +634,30 @@ def _parse_events_html(html: str, url: str) -> list[Event]:
 
 @mcp.tool()
 def parse_events(html: str, url: str) -> list[Event]:
+	"""Parse a single HTML document into normalized event items.
+
+	Args:
+		html: The HTML document to analyze.
+		url: The source URL used for link resolution and event heuristics.
+
+	Returns:
+		A list of Event items extracted from the page. Returns an empty list
+		if the HTML does not look like an event page or event listing.
+	"""
 	return _parse_events_html(html, url)
 
 
 @mcp.tool()
-def filter_events_by_date(events: list[Event], date: str) -> list[Event]:
-	"""Deprecated: use filter_items_by_date for unified date filtering.
-
-	Kept for backward compatibility for event-only callers.
-	"""
-	filtered = filter_items_by_date(events, date)
-	return [e for e in filtered if isinstance(e, Event)]
-
-
-@mcp.tool()
 def get_today_events(urls: list[str], date: str) -> list[Event]:
+	"""Fetch event pages, parse events, and return only matching-date events.
+
+	Args:
+		urls: Absolute URLs to fetch and parse as event sources.
+		date: Target date to keep after canonical normalization.
+
+	Returns:
+		Deduplicated Event items whose canonical date matches the requested date.
+	"""
 	fetched = fetch_html(urls)
 	parsed: list[Event] = []
 	for source_url, html in fetched.pages.items():
