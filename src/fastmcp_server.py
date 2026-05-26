@@ -642,8 +642,8 @@ def main() -> None:
 	path = os.getenv("FASTMCP_PATH", "/mcp")
 	mcp.settings.host = host
 	mcp.settings.port = port
-	mcp.settings.mount_path = path
-	mcp.run(transport="sse", mount_path=path)
+	mcp.settings.streamable_http_path = path
+	mcp.run(transport="streamable-http")
 
 
 if __name__ == "__main__":
