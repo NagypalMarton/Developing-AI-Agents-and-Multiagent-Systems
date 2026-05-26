@@ -453,7 +453,7 @@ def parse_news(html: str, url: str) -> list[News]:
 
 
 @mcp.tool()
-def filter_items_by_date(items: list[News] | list[Event], date: str) -> list[News] | list[Event]:
+def filter_items_by_date(items: list[News] | list[Event], date: str) -> list[News | Event]:
 	target_date = _normalize_date_string(date)
 	filtered: list[News | Event] = []
 	for item in items:
@@ -640,7 +640,10 @@ def main() -> None:
 	host = os.getenv("FASTMCP_HOST", "0.0.0.0")
 	port = int(os.getenv("FASTMCP_PORT", "8000"))
 	path = os.getenv("FASTMCP_PATH", "/mcp")
-	mcp.run(transport="sse", host=host, port=port, path=path)
+	mcp.settings.host = host
+	mcp.settings.port = port
+	mcp.settings.mount_path = path
+	mcp.run(transport="sse", mount_path=path)
 
 
 if __name__ == "__main__":
