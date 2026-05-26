@@ -495,34 +495,6 @@ def filter_items_by_date(items: list[News] | list[Event], date: str) -> list[New
 	return filtered
 
 
-@mcp.tool()
-def get_today_news(urls: list[str], date: str) -> list[News]:
-	"""Fetch news pages, parse news items, and return only matching-date news.
-
-	Args:
-		urls: Absolute URLs to fetch and parse as news sources.
-		date: Target date to keep after canonical normalization.
-
-	Returns:
-		Deduplicated News items whose canonical date matches the requested date.
-	"""
-	fetched = fetch_html(urls)
-	parsed_news: list[News] = []
-	for source_url, html in fetched.pages.items():
-		parsed_news.extend(_parse_news_html(html, source_url))
-
-	filtered = filter_items_by_date(parsed_news, date)
-	deduped: list[News] = []
-	seen: set[tuple[str, str, str]] = set()
-	for item in filtered:
-		identity = (item.title, item.date, item.url)
-		if identity in seen:
-			continue
-		seen.add(identity)
-		deduped.append(item)
-	return deduped
-
-
 def _parse_events_html(html: str, url: str) -> list[Event]:
 	_normalize_url(url)
 	soup = BeautifulSoup(html, "html.parser")
@@ -645,35 +617,6 @@ def parse_events(html: str, url: str) -> list[Event]:
 		if the HTML does not look like an event page or event listing.
 	"""
 	return _parse_events_html(html, url)
-
-
-@mcp.tool()
-def get_today_events(urls: list[str], date: str) -> list[Event]:
-	"""Fetch event pages, parse events, and return only matching-date events.
-
-	Args:
-		urls: Absolute URLs to fetch and parse as event sources.
-		date: Target date to keep after canonical normalization.
-
-	Returns:
-		Deduplicated Event items whose canonical date matches the requested date.
-	"""
-	fetched = fetch_html(urls)
-	parsed: list[Event] = []
-	for source_url, html in fetched.pages.items():
-		parsed.extend(parse_events(html, source_url))
-
-	filtered_items = filter_items_by_date(parsed, date)
-	filtered = [item for item in filtered_items if isinstance(item, Event)]
-	deduped: list[Event] = []
-	seen: set[tuple[str, str]] = set()
-	for item in filtered:
-		identity = (item.event_title, item.event_date)
-		if identity in seen:
-			continue
-		seen.add(identity)
-		deduped.append(item)
-	return deduped
 
 
 def main() -> None:
