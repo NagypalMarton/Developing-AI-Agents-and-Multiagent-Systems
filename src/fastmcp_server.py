@@ -11,6 +11,7 @@ from urllib.request import Request, urlopen
 
 from bs4 import BeautifulSoup
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import BaseModel, Field
 
 
@@ -643,6 +644,20 @@ def main() -> None:
 	mcp.settings.host = host
 	mcp.settings.port = port
 	mcp.settings.streamable_http_path = path
+	if mcp.settings.transport_security is None:
+		mcp.settings.transport_security = TransportSecuritySettings()
+	mcp.settings.transport_security.allowed_hosts = [
+		"127.0.0.1:*",
+		"localhost:*",
+		"[::1]:*",
+		"fastmcp-server:*",
+	]
+	mcp.settings.transport_security.allowed_origins = [
+		"http://127.0.0.1:*",
+		"http://localhost:*",
+		"http://[::1]:*",
+		"http://fastmcp-server:*",
+	]
 	mcp.run(transport="streamable-http")
 
 
