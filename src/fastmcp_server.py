@@ -207,31 +207,6 @@ def _extract_visible_text(node) -> str:
 	return _clean_text(node.get_text(" ", strip=True))
 
 
-def _clean_html(html: str) -> str:
-	"""Remove noisy tags, comments and inline event attributes from HTML.
-
-	Keeps structural HTML but strips scripts/styles/comments and javascript: hrefs.
-	"""
-	if not html:
-		return ""
-	soup = BeautifulSoup(html, "html.parser")
-	for tag in soup(["script", "style", "noscript", "iframe", "svg", "canvas"]):
-		tag.decompose()
-	for c in soup.find_all(string=lambda s: isinstance(s, Comment)):
-		c.extract()
-	for el in soup.find_all(True):
-		for attr in list(el.attrs):
-			if attr.lower().startswith("on"):
-				del el[attr]
-			elif attr.lower() == "style":
-				del el[attr]
-			elif attr.lower() == "href":
-				val = (el.get("href") or "").strip().lower()
-				if val.startswith("javascript:"):
-					del el[attr]
-	return str(soup)
-
-
 def _extract_page_title(soup: BeautifulSoup) -> str:
 	return _extract_meta_content(
 		soup,
@@ -471,7 +446,7 @@ def fetch_html(urls: list[str]) -> RawHTML:
 			with urlopen(request, timeout=20) as response:
 				charset = response.headers.get_content_charset() or "utf-8"
 				raw_html = response.read().decode(charset, errors="replace")
-				pages[url] = _clean_html(raw_html)
+				pages[url] = raw_html
 		except (HTTPError, URLError, TimeoutError, OSError) as exc:
 			logger.warning("Failed to fetch %s: %s", url, exc)
 			pages[url] = ""
