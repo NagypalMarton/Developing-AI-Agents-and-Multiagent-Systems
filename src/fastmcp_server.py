@@ -413,6 +413,137 @@ def _parse_news_html(html: str, url: str) -> list[News]:
 	return _parse_article_page(html, url)
 
 
+def _append_unique_block(blocks, seen_ids, candidate) -> None:
+	container_id = id(candidate)
+	if container_id in seen_ids:
+		return
+
+	if any(candidate.find_parent(lambda parent, current=block: parent is current) is not None for block in blocks):
+		return
+
+	blocks[:] = [
+		block
+		for block in blocks
+		if block.find_parent(lambda parent, current=candidate: parent is current) is None
+	]
+	blocks.append(candidate)
+	seen_ids.add(container_id)
+
+
+def _collect_news_blocks(soup: BeautifulSoup, url: str):
+	blocks = []
+	seen_ids: set[int] = set()
+
+	for selector in ["article", "main", ".node__content", ".field--name-body", ".content", "#content"]:
+		element = soup.select_one(selector)
+		if element is None:
+			continue
+		if _extract_visible_text(element):
+			_append_unique_block(blocks, seen_ids, element)
+
+	for anchor in soup.find_all("a", href=True):
+		href = anchor.get("href", "")
+		absolute_url = urljoin(url, href)
+		if not _looks_like_article_link(href, url):
+			continue
+		if anchor.find_parent(["nav", "header", "footer", "aside", "form", "script"]):
+			continue
+
+		container = anchor.find_parent(["article", "li", "section", "div", "main"]) or anchor.parent
+		if container is None:
+			continue
+
+		title = _clean_text(anchor.get_text(" ", strip=True))
+		if not title or len(title) < 4:
+			continue
+
+		container_text = _extract_visible_text(container)
+		if len(container_text) < len(title) + 20:
+			continue
+
+		_append_unique_block(blocks, seen_ids, container)
+
+	return blocks
+
+
+def _collect_event_blocks(soup: BeautifulSoup, url: str):
+	blocks = []
+	seen_ids: set[int] = set()
+
+	for container in soup.find_all(["article", "li", "section", "div"]):
+		classes = " ".join(container.get("class") or [])
+		text = _extract_visible_text(container)
+		if (
+			"event" not in classes.lower()
+			and "vevent" not in classes.lower()
+			and "program" not in classes.lower()
+			and "agenda" not in classes.lower()
+			and not container.select_one("time")
+			and "event" not in container.get_text(" ", strip=True).lower()
+		):
+			continue
+
+		title = ""
+		for sel in ("h1", "h2", "h3", "a", "strong"):
+			el = container.select_one(sel)
+			if el and _clean_text(el.get_text(" ", strip=True)):
+				title = _clean_text(el.get_text(" ", strip=True))
+				break
+		if not title:
+			continue
+
+		date_text = ""
+		time_el = container.select_one("time")
+		if time_el:
+			raw = time_el.get("datetime") or time_el.get_text(" ", strip=True)
+			raw = _clean_text(raw)
+			if raw:
+				date_text = raw
+
+		if not date_text:
+			for pattern in (
+				re.search(r"\d{4}[./\- ]+[A-Za-zÁÉÍÓÖŐÚÜŰáéíóöőúüű]+[./\- ]+\d{1,2}", text),
+				re.search(r"\d{4}[./\- ]+\d{1,2}[./\- ]+\d{1,2}", text),
+				re.search(r"[A-Za-zÁÉÍÓÖŐÚÜŰáéíóöőúüű]+\s+\d{1,2},?\s+20\d{2}", text),
+			):
+				if pattern:
+					date_text = pattern.group(0)
+					break
+
+		_append_unique_block(blocks, seen_ids, container)
+
+	return blocks
+
+
+def _extract_relevant_html_blocks(html: str, url: str) -> str:
+	if not html.strip():
+		return ""
+
+	soup = BeautifulSoup(html, "html.parser")
+	selected_blocks = []
+	selected_ids: set[int] = set()
+
+	for block in _collect_news_blocks(soup, url):
+		_append_unique_block(selected_blocks, selected_ids, block)
+
+	for block in _collect_event_blocks(soup, url):
+		_append_unique_block(selected_blocks, selected_ids, block)
+
+	if not selected_blocks:
+		return ""
+
+	output_soup = BeautifulSoup("<html><body></body></html>", "html.parser")
+	body = output_soup.find("body")
+	if body is None:
+		return ""
+	for block in selected_blocks:
+		fragment = BeautifulSoup(str(block), "html.parser")
+		if fragment.contents:
+			body.append(fragment.contents[0])
+
+	return str(output_soup)
+
+
 @mcp.tool()
 def fetch_html(urls: list[str]) -> RawHTML:
 	"""Fetch web pages and return a URL-to-HTML map for downstream parsing tools.
@@ -450,7 +581,7 @@ def fetch_html(urls: list[str]) -> RawHTML:
 			with urlopen(request, timeout=20) as response:
 				charset = response.headers.get_content_charset() or "utf-8"
 				raw_html = response.read().decode(charset, errors="replace")
-				pages[url] = raw_html
+				pages[url] = _extract_relevant_html_blocks(raw_html, url)
 		except (HTTPError, URLError, TimeoutError, OSError) as exc:
 			logger.warning("Failed to fetch %s: %s", url, exc)
 			pages[url] = ""
