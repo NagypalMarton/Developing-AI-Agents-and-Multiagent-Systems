@@ -415,14 +415,18 @@ def _parse_news_html(html: str, url: str) -> list[News]:
 
 @mcp.tool()
 def fetch_html(urls: list[str]) -> RawHTML:
-	"""Download each URL and return the raw HTML response per URL.
+	"""Fetch web pages and return a URL-to-HTML map for downstream parsing tools.
+
+	This tool only downloads and decodes page content; it does not extract
+	news or events. Use its output with `parse_news` or `parse_events`.
 
 	Args:
 		urls: Absolute HTTP/HTTPS URLs to fetch.
 
 	Returns:
-		A RawHTML object whose pages map contains the fetched HTML strings.
-		Failed fetches are stored as empty strings.
+		A RawHTML object with `pages`, where each key is a normalized URL and
+		each value is the decoded HTML string for that page.
+		Failed or invalid inputs are represented with empty-string values.
 	"""
 	pages: dict[str, str] = {}
 	for raw_url in urls:
@@ -455,15 +459,20 @@ def fetch_html(urls: list[str]) -> RawHTML:
 
 @mcp.tool()
 def parse_news(html: str, url: str) -> list[News]:
-	"""Parse a single HTML document into normalized news items.
+	"""Extract news items from one HTML document.
+
+	This tool parses article pages and listing/home pages, then returns
+	structured `News` objects. Typically call `fetch_html` first, then pass
+	the returned HTML for a specific URL into this tool.
 
 	Args:
-		html: The HTML document to analyze.
-		url: The source URL used for link resolution and article heuristics.
+		html: The HTML content of one page.
+		url: The source page URL used for validation, link resolution, and
+			article/listing heuristics.
 
 	Returns:
-		A list of News items extracted from the page. Returns an empty list
-		if the HTML does not look like a news article or listing page.
+		A list of normalized `News` items with title, date, content, and URL.
+		Returns an empty list when no news-like content is detected.
 	"""
 	_normalize_url(url)
 	return _parse_news_html(html, url)
@@ -471,14 +480,14 @@ def parse_news(html: str, url: str) -> list[News]:
 
 @mcp.tool()
 def filter_items_by_date(items: list[News] | list[Event], date: str) -> list[News | Event]:
-	"""Keep only items whose date matches the requested date.
+	"""Filter parsed news/events to a single target date.
 
-	The input date is normalized with the server's canonical date parser
-	(e.g. 2026.May.26). This tool works for both News.date and Event.event_date.
+	The input date is normalized to the server's canonical format
+	(e.g. 2026.May.26). Works with both `News.date` and `Event.event_date`.
 
 	Args:
-		items: A mixed list of News or Event objects.
-		date: Date string in the server's accepted formats.
+		items: A list of `News` or a list of `Event` objects.
+		date: Target date string in any supported input format.
 
 	Returns:
 		A list containing only items whose canonical date equals the target date.
@@ -603,15 +612,20 @@ def _parse_events_html(html: str, url: str) -> list[Event]:
 
 @mcp.tool()
 def parse_events(html: str, url: str) -> list[Event]:
-	"""Parse a single HTML document into normalized event items.
+	"""Extract event items from one HTML document.
+
+	This tool scans event pages/listings and returns structured `Event`
+	objects. Typically call `fetch_html` first, then pass the HTML for a
+	specific URL into this tool.
 
 	Args:
-		html: The HTML document to analyze.
-		url: The source URL used for link resolution and event heuristics.
+		html: The HTML content of one page.
+		url: The source page URL used for validation, link resolution, and
+			event heuristics.
 
 	Returns:
-		A list of Event items extracted from the page. Returns an empty list
-		if the HTML does not look like an event page or event listing.
+		A list of normalized `Event` items.
+		Returns an empty list when no event-like content is detected.
 	"""
 	return _parse_events_html(html, url)
 
