@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from html import unescape
-from html.parser import HTMLParser
 from typing import Optional
 import os
 from urllib.error import HTTPError, URLError
@@ -12,6 +11,7 @@ from urllib.request import Request, urlopen
 import re
 
 from fastmcp import FastMCP
+from bs4 import BeautifulSoup
 from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field
 
 
@@ -86,12 +86,6 @@ class NewsItem(BaseModel):
 	image_url: Optional[AnyHttpUrl] = None
 
 
-class NewsExtractionRequest(BaseModel):
-	model_config = ConfigDict(str_strip_whitespace=True)
-
-	urls: list[AnyHttpUrl] = Field(min_length=1)
-
-
 @dataclass(frozen=True)
 class RawItem:
 	title: str
@@ -101,23 +95,6 @@ class RawItem:
 	location: Optional[str] = None
 	image_url: Optional[str] = None
 	category: str = "unknown"
-
-
-try:
-	from bs4 import BeautifulSoup  # type: ignore
-except ImportError:  # pragma: no cover - optional dependency
-	BeautifulSoup = None
-
-
-class _SimpleHTMLTextExtractor(HTMLParser):
-	def __init__(self) -> None:
-		super().__init__()
-		self.parts: list[str] = []
-
-	def handle_data(self, data: str) -> None:
-		text = data.strip()
-		if text:
-			self.parts.append(text)
 
 
 def _fetch_html(url: str) -> str:
@@ -136,9 +113,7 @@ def _clean_text(value: Optional[str]) -> Optional[str]:
 
 
 def _extract_text_from_html(fragment: str) -> str:
-	extractor = _SimpleHTMLTextExtractor()
-	extractor.feed(fragment)
-	return _clean_text(" ".join(extractor.parts)) or ""
+	return _clean_text(BeautifulSoup(fragment, "html.parser").get_text(" ", strip=True)) or ""
 
 
 def _normalize_date(text: Optional[str]) -> Optional[str]:
@@ -184,12 +159,7 @@ def _detect_category(title: str, summary: Optional[str], url: str) -> str:
 
 
 def _parse_with_bs4(html: str, base_url: str) -> list[RawItem]:
-	if BeautifulSoup is None:
-		return []
-
 	soup = BeautifulSoup(html, "html.parser")
-	if soup is None:
-		return []
 
 	candidates: list[RawItem] = []
 	seen: set[tuple[str, str]] = set()
@@ -200,8 +170,6 @@ def _parse_with_bs4(html: str, base_url: str) -> list[RawItem]:
 		"div.bme_news_card",
 		"a.h-p100.d-block",
 		"div.event",
-		"div.views-row article",
-		"div.views-row",
 	]
 
 	for selector in selectors:
@@ -236,7 +204,7 @@ def _parse_with_bs4(html: str, base_url: str) -> list[RawItem]:
 			seen.add(dedupe_key)
 
 			summary_node = node.select_one(
-				".news-excerpt, .news-content p, .bme_news_card-body p, .bme_event_card-body p, .field-name-body p, .field--name-body p, p"
+				".news-excerpt, .news-content p, .bme_news_card-body p, .bme_event_card-body p, .field-name-body p, .field--name-body p"
 			)
 			summary = _clean_text(summary_node.get_text(" ", strip=True)) if summary_node else None
 
@@ -268,116 +236,6 @@ def _parse_with_bs4(html: str, base_url: str) -> list[RawItem]:
 			)
 
 	return candidates
-
-
-def _parse_without_bs4(html: str, base_url: str) -> list[RawItem]:
-	candidates: list[RawItem] = []
-	seen: set[tuple[str, str]] = set()
-
-	patterns = [
-		re.compile(r'<div class="news-item">(.*?)</div>\s*</div>', re.DOTALL | re.IGNORECASE),
-		re.compile(r'<article[^>]*node-hir[^>]*>(.*?)</article>', re.DOTALL | re.IGNORECASE),
-		re.compile(r'<div class="bme_news_card.*?">(.*?)</div>\s*</div>', re.DOTALL | re.IGNORECASE),
-		re.compile(r'<a[^>]*class="[^"]*h-p100[^"]*d-block[^"]*"[^>]*>(.*?)</a>', re.DOTALL | re.IGNORECASE),
-		re.compile(r'<div[^>]*class="(?:event|[^"]*\sevent\b[^"]*)"[^>]*>(.*?)</div>', re.DOTALL | re.IGNORECASE),
-	]
-
-	for pattern in patterns:
-		for match in pattern.finditer(html):
-			block = match.group(0)
-			title_match = re.search(
-				r'<(?:h2|h4)[^>]*>\s*<a[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
-				block,
-				re.IGNORECASE | re.DOTALL,
-			)
-			if not title_match:
-				title_match = re.search(
-					r'<a[^>]*class="[^"]*event-title[^"]*"[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
-					block,
-					re.IGNORECASE | re.DOTALL,
-				)
-			if not title_match:
-				title_match = re.search(
-					r'<a[^>]*href="([^"]+)"[^>]*>\s*.*?<h4[^>]*bme_event_card-title[^>]*>(.*?)</h4>',
-					block,
-					re.IGNORECASE | re.DOTALL,
-				)
-			if not title_match:
-				continue
-
-			href = title_match.group(1)
-			title = _extract_text_from_html(title_match.group(2))
-			if not title:
-				continue
-
-			item_url = urljoin(base_url, href)
-			dedupe_key = (title.lower(), item_url)
-			if dedupe_key in seen:
-				continue
-			seen.add(dedupe_key)
-
-			summary_match = re.search(
-				r'(?:news-excerpt|bme_news_card-body|bme_event_card-body|field-name-body|field--name-body).*?<p>(.*?)</p>',
-				block,
-				re.IGNORECASE | re.DOTALL,
-			)
-			summary = _extract_text_from_html(summary_match.group(1)) if summary_match else None
-
-			date_match = re.search(
-				r'(?:news-date|event-date|bme_event_card-date|field--name-created|created)[^>]*>(.*?)<',
-				block,
-				re.IGNORECASE | re.DOTALL,
-			)
-			published_at = _normalize_date(_extract_text_from_html(date_match.group(1)) if date_match else None)
-
-			location_match = re.search(
-				r'(?:bme_event_card-location)[^>]*>(.*?)<',
-				block,
-				re.IGNORECASE | re.DOTALL,
-			)
-			location = _extract_text_from_html(location_match.group(1)) if location_match else None
-
-			image_match = re.search(r'<img[^>]+src="([^"]+)"', block, re.IGNORECASE)
-			image_url = urljoin(base_url, image_match.group(1)) if image_match else None
-
-			candidates.append(
-				RawItem(
-					title=title,
-					item_url=item_url,
-					summary=summary,
-					published_at=published_at,
-					location=location,
-					image_url=image_url,
-					category=_detect_category(title, summary, item_url),
-				)
-			)
-
-	return candidates
-
-
-def _extract_items_from_html(html: str, base_url: str) -> list[RawItem]:
-	if BeautifulSoup is not None:
-		items = _parse_with_bs4(html, base_url)
-		if items:
-			return items
-	return _parse_without_bs4(html, base_url)
-
-
-def _validate_result_item(raw_item: RawItem, source_url: str) -> NewsItem:
-	return NewsItem.model_validate(
-		{
-			"source_url": source_url,
-			"title": raw_item.title,
-			"item_url": raw_item.item_url,
-			"category": raw_item.category,
-			"published_at": raw_item.published_at,
-			"summary": raw_item.summary,
-			"location": raw_item.location,
-			"image_url": raw_item.image_url,
-		}
-	)
-
-
 @mcp.tool()
 def extract_news_and_events(urls: list[AnyHttpUrl]) -> list[dict[str, object]]:
 	"""Fetch each URL, parse the page HTML, and return normalized news/event items.
@@ -394,35 +252,37 @@ def extract_news_and_events(urls: list[AnyHttpUrl]) -> list[dict[str, object]]:
 	source_url, title, item_url, category, published_at, summary, location, and image_url.
 	"""
 
-	request = NewsExtractionRequest(urls=urls)
 	items: list[NewsItem] = []
 	seen: set[tuple[str, str]] = set()
 
-	for url in request.urls:
+	for url in urls:
 		source_url = str(url)
 		try:
 			html = _fetch_html(source_url)
 		except (HTTPError, URLError, TimeoutError, ValueError) as exc:
 			raise ValueError(f"Failed to fetch {source_url}: {exc}") from exc
 
-		for raw_item in _extract_items_from_html(html, source_url):
+		for raw_item in _parse_with_bs4(html, source_url):
 			dedupe_key = (raw_item.title.lower(), raw_item.item_url)
 			if dedupe_key in seen:
 				continue
 			seen.add(dedupe_key)
-			items.append(_validate_result_item(raw_item, source_url))
+			items.append(
+				NewsItem.model_validate(
+					{
+						"source_url": source_url,
+						"title": raw_item.title,
+						"item_url": raw_item.item_url,
+						"category": raw_item.category,
+						"published_at": raw_item.published_at,
+						"summary": raw_item.summary,
+						"location": raw_item.location,
+						"image_url": raw_item.image_url,
+					}
+				)
+			)
 
 	return [item.model_dump(mode="json") for item in items]
-
-
-@mcp.tool()
-def normalize_source_urls(urls: list[AnyHttpUrl]) -> list[str]:
-	"""Validate and normalize URLs without fetching them."""
-
-	request = NewsExtractionRequest(urls=urls)
-	return [str(url) for url in request.urls]
-
-
 if __name__ == "__main__":
 	transport = os.getenv("FASTMCP_TRANSPORT", "stdio")
 	if transport in ("http", "streamable-http", "sse"):
