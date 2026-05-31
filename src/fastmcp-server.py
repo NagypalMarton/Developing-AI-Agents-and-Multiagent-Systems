@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from html import unescape
 import logging
-from typing import Optional
+from typing import Literal, Optional
 import os
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin
@@ -13,7 +13,7 @@ import re
 
 from fastmcp import FastMCP
 from bs4 import BeautifulSoup
-from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field
+from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field, ValidationError
 
 
 mcp = FastMCP("news-event-extractor")
@@ -58,6 +58,9 @@ REGISTRATION_URL_KEYWORDS = (
 
 UNKNOWN_GUESTS_LIST = "Nem Ismert"
 UNKNOWN_REGISTRATION_URL = "Nem található"
+NETWORK_ERROR_MESSAGE = "Letöltés sikertelen hálózati hiba miatt!"
+SCHEMA_ERROR_MESSAGE = "Az adott kinyert szöveg nem felel meg a Pydantic sémának!"
+UNHANDLED_ERROR_MESSAGE = "Kezeletlen hiba keletkezett!"
 
 NEWS_ITEM_SELECTORS = (
 	"div.news-item",
@@ -99,6 +102,11 @@ NEWS_ITEM_DATE_SELECTORS = (
 
 NEWS_ITEM_LOCATION_SELECTORS = (
 	".bme_event_card-location",
+	".bme_news_card-location",
+	".news-location",
+	".location",
+	"address",
+	".field--name-field-location",
 )
 
 ENTRY_TEXT_TITLE_SELECTORS = (
@@ -163,19 +171,27 @@ DATE_PATTERNS = (
 )
 
 
-class NewsItem(BaseModel):
+class BaseItemResponse(BaseModel):
 	model_config = ConfigDict(str_strip_whitespace=True)
 
 	source_url: AnyHttpUrl
 	title: str = Field(min_length=1)
 	item_url: AnyHttpUrl
-	category: str = Field(pattern=r"^(news|event|unknown)$")
+	category: Literal["news", "event"]
 	published_at: Optional[str] = None
 	summary: Optional[str] = None
-	location: Optional[str] = None
-	guests_list: Optional[str] = None
-	registration_url: Optional[str] = None
 	image_url: Optional[AnyHttpUrl] = None
+
+
+class NewsItemResponse(BaseItemResponse):
+	category: Literal["news"] = "news"
+
+
+class EventItemResponse(BaseItemResponse):
+	category: Literal["event"] = "event"
+	location: Optional[str] = None
+	guests_list: str = Field(default=UNKNOWN_GUESTS_LIST, min_length=1)
+	registration_url: str = Field(default=UNKNOWN_REGISTRATION_URL, min_length=1)
 
 
 class EntryTextResponse(BaseModel):
@@ -196,7 +212,7 @@ class RawItem:
 	guests_list: Optional[str] = None
 	registration_url: Optional[str] = None
 	image_url: Optional[str] = None
-	category: str = "unknown"
+	category: Literal["news", "event"] = "news"
 
 
 def _fetch_html(url: str) -> str:
@@ -252,15 +268,59 @@ def _normalize_date(text: Optional[str]) -> Optional[str]:
 	return cleaned
 
 
-def _detect_category(title: str, summary: Optional[str], url: str) -> str:
+def _detect_category(title: str, summary: Optional[str], url: str) -> Literal["news", "event"]:
 	text = f"{title} {summary or ''} {url}".lower()
 	if any(token in text for token in ("esemeny", "esemenyek", "esemény", "események")):
 		return "event"
 	if any(keyword in text for keyword in EVENT_KEYWORDS):
 		return "event"
-	if any(token in text for token in ("hir", "hír", "news", "hirek", "hírek")):
-		return "news"
-	return "unknown"
+	return "news"
+
+
+def _detect_category_from_html(node, item_url: str) -> Literal["news", "event"]:
+	haystack = f"{item_url} {' '.join(node.get('class', [])) if node.get('class') else ''}".lower()
+	text = _clean_text(node.get_text(" ", strip=True)) or ""
+	text = text.lower()
+
+	event_markers = (
+		"div.event",
+		".event",
+		".event-title",
+		".event-date",
+		".bme_event_card",
+		".bme_event_card-title",
+		".bme_event_card-location",
+	)
+	news_markers = (
+		"div.news-item",
+		"article.node-hir",
+		".news-date",
+		".news-excerpt",
+		".bme_news_card",
+		".bme_news_card-title",
+	)
+	event_score = 0
+	news_score = 0
+
+	if any(token in haystack for token in ("/esemeny/", "/esemény/", "/event/")):
+		event_score += 2
+	if any(token in haystack for token in ("/hir/", "/hír/", "/news/")):
+		news_score += 2
+	if node.get("class") and any(cls in {"event", "bme_event_card"} for cls in node.get("class", [])):
+		event_score += 3
+	if node.get("class") and any(cls in {"news-item", "bme_news_card", "node-hir"} for cls in node.get("class", [])):
+		news_score += 3
+	if any(node.select_one(selector) is not None for selector in event_markers):
+		event_score += 1
+	if any(node.select_one(selector) is not None for selector in news_markers):
+		news_score += 1
+	if any(keyword in text for keyword in EVENT_GUEST_KEYWORDS) or any(keyword in text for keyword in REGISTRATION_URL_KEYWORDS):
+		event_score += 1
+	if any(token in text for token in ("hír", "hírek", "news", "hirek")):
+		news_score += 1
+	if event_score >= news_score:
+		return "event"
+	return "news"
 
 
 def _normalize_guests_list(text: Optional[str]) -> Optional[str]:
@@ -380,12 +440,25 @@ def _parse_with_bs4(html: str, base_url: str) -> list[RawItem]:
 
 			location_node = node.select_one(", ".join(NEWS_ITEM_LOCATION_SELECTORS))
 			location = _clean_text(location_node.get_text(" ", strip=True)) if location_node else None
-			category = _detect_category(title, summary, item_url)
+			category = _detect_category_from_html(node, item_url)
 			guests_list = None
 			registration_url = None
 			if category == "event":
-				guests_list = _extract_event_guests_list(node) or UNKNOWN_GUESTS_LIST
-				registration_url = _extract_registration_url(node, base_url) or UNKNOWN_REGISTRATION_URL
+				guests_list = _extract_event_guests_list(node)
+				registration_url = _extract_registration_url(node, base_url)
+				# Fallback: if not found in the list card, try the item's detail page
+				if not guests_list or not registration_url:
+					try:
+						detail_html = _fetch_html(item_url)
+						detail_soup = BeautifulSoup(detail_html, "html.parser")
+						if not guests_list:
+							guests_list = _extract_event_guests_list(detail_soup)
+						if not registration_url:
+							registration_url = _extract_registration_url(detail_soup, item_url)
+					except Exception:
+						logger.debug("Failed to fetch detail page for %s", item_url)
+				guests_list = guests_list or UNKNOWN_GUESTS_LIST
+				registration_url = registration_url or UNKNOWN_REGISTRATION_URL
 
 			image_node = node.select_one("img")
 			image_url = None
@@ -475,16 +548,32 @@ def extract_entry_text(urls: list[AnyHttpUrl]) -> list[dict[str, object]]:
 
 	for url in urls:
 		source = str(url)
-		html = _fetch_html_or_error(source)
-		soup = BeautifulSoup(html, "html.parser")
-		title, text = _extract_entry_text_block(soup)
-		validated = EntryTextResponse.model_validate(
-			{
-				"source_url": source,
-				"title": title,
-				"text": text,
-			}
-		)
+		try:
+			html = _fetch_html(source)
+		except (HTTPError, URLError, TimeoutError):
+			results.append({"source_url": source, "error": NETWORK_ERROR_MESSAGE})
+			continue
+		except Exception as exc:
+			results.append({"source_url": source, "error": f"{UNHANDLED_ERROR_MESSAGE} {exc}"})
+			continue
+
+		try:
+			soup = BeautifulSoup(html, "html.parser")
+			title, text = _extract_entry_text_block(soup)
+			validated = EntryTextResponse.model_validate(
+				{
+					"source_url": source,
+					"title": title,
+					"text": text,
+				}
+			)
+		except ValidationError:
+			results.append({"source_url": source, "error": SCHEMA_ERROR_MESSAGE})
+			continue
+		except Exception as exc:
+			results.append({"source_url": source, "error": f"{UNHANDLED_ERROR_MESSAGE} {exc}"})
+			continue
+
 		results.append(validated.model_dump(mode="json"))
 
 	return results
@@ -501,12 +590,13 @@ def extract_news_and_events(urls: list[AnyHttpUrl]) -> list[dict[str, object]]:
 	4. normalizes the date to ISO-8601 when possible,
 	5. deduplicates repeated items across URLs.
 
-	The result is a JSON-serializable list of validated records with keys:
-	source_url, title, item_url, category, published_at, summary, location, guests_list,
-	registration_url, and image_url.
+	The result is a JSON-serializable list of validated records using two schemas:
+	- news: source_url, title, item_url, category, published_at, summary, and image_url
+	- event: source_url, title, item_url, category, published_at, summary, location, guests_list,
+	  registration_url, and image_url
 	"""
 
-	items: list[NewsItem] = []
+	items: list[BaseItemResponse] = []
 	seen: set[tuple[str, str]] = set()
 
 	for url in urls:
@@ -518,20 +608,35 @@ def extract_news_and_events(urls: list[AnyHttpUrl]) -> list[dict[str, object]]:
 			if dedupe_key in seen:
 				continue
 			seen.add(dedupe_key)
-			items.append(
-				NewsItem.model_validate(
-					{
-						"source_url": source_url,
-						"title": raw_item.title,
-						"item_url": raw_item.item_url,
-						"category": raw_item.category,
-						"published_at": raw_item.published_at,
-						"summary": raw_item.summary,
-						"location": raw_item.location,
-						"image_url": raw_item.image_url,
-					}
+			base_payload = {
+				"source_url": source_url,
+				"title": raw_item.title,
+				"item_url": raw_item.item_url,
+				"published_at": raw_item.published_at,
+				"summary": raw_item.summary,
+				"image_url": raw_item.image_url,
+			}
+			if raw_item.category == "event":
+				items.append(
+					EventItemResponse.model_validate(
+						{
+							**base_payload,
+							"category": "event",
+							"location": raw_item.location,
+							"guests_list": raw_item.guests_list or UNKNOWN_GUESTS_LIST,
+							"registration_url": raw_item.registration_url or UNKNOWN_REGISTRATION_URL,
+						}
+					)
 				)
-			)
+			elif raw_item.category == "news":
+				items.append(
+					NewsItemResponse.model_validate(
+						{
+							**base_payload,
+							"category": "news",
+						}
+					)
+				)
 
 	return [item.model_dump(mode="json") for item in items]
 if __name__ == "__main__":
