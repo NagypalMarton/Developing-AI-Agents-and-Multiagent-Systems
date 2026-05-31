@@ -13,4 +13,4 @@ ENV FASTMCP_PATH=/mcp
 
 EXPOSE 8000
 
-CMD ["python", "src/fastmcp_server.py"]
+CMD ["python", "src/fastmcp-server.py"]
