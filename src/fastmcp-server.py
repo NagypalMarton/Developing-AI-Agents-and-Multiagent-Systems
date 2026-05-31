@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from html import unescape
+import logging
 from typing import Optional
 import os
 from urllib.error import HTTPError, URLError
@@ -16,6 +17,7 @@ from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field
 
 
 mcp = FastMCP("news-event-extractor")
+logger = logging.getLogger(__name__)
 
 
 EVENT_KEYWORDS = (
@@ -28,6 +30,67 @@ EVENT_KEYWORDS = (
 	"szeminárium",
 	"meeting",
 	"találkozó",
+)
+
+NEWS_ITEM_SELECTORS = (
+	"div.news-item",
+	"article.node-hir",
+	"div.bme_news_card",
+	"a.h-p100.d-block",
+	"div.event",
+)
+
+NEWS_ITEM_TITLE_SELECTORS = (
+	"h2 a",
+	"h4 a",
+	".node__title a",
+	".event-title",
+	".bme_event_card-title",
+	"h2",
+	"h4",
+	".bme_news_card-title",
+)
+
+NEWS_ITEM_SUMMARY_SELECTORS = (
+	".news-excerpt",
+	".news-content p",
+	".bme_news_card-body p",
+	".bme_event_card-body p",
+	".field-name-body p",
+	".field--name-body p",
+)
+
+NEWS_ITEM_DATE_SELECTORS = (
+	".news-date",
+	".event-date",
+	".bme_event_card-date",
+	".field--name-created",
+	".created",
+	"time",
+	"datetime",
+)
+
+NEWS_ITEM_LOCATION_SELECTORS = (
+	".bme_event_card-location",
+)
+
+ENTRY_TEXT_TITLE_SELECTORS = (
+	"h1.page-title",
+	"article header [property='dc:title']",
+	"article h1",
+	".page-title",
+	"meta[property='og:title']",
+)
+
+ENTRY_TEXT_CONTAINER_SELECTORS = (
+	"article.node-hir .field--name-body",
+	"article.node-hir .field-name-body",
+	"article.node-hir .field-items",
+	"div.field--name-field-paragraphs",
+	"div.main-page-container .page-content",
+	"div.page-content",
+	"article.node-hir",
+	".field-name-body",
 )
 
 MONTH_NAME_TO_NUMBER = {
@@ -86,6 +149,14 @@ class NewsItem(BaseModel):
 	image_url: Optional[AnyHttpUrl] = None
 
 
+class EntryTextResponse(BaseModel):
+	model_config = ConfigDict(str_strip_whitespace=True)
+
+	source_url: AnyHttpUrl
+	title: Optional[str] = None
+	text: str = Field(min_length=1)
+
+
 @dataclass(frozen=True)
 class RawItem:
 	title: str
@@ -105,15 +176,18 @@ def _fetch_html(url: str) -> str:
 		return body.decode(charset, errors="replace")
 
 
+def _fetch_html_or_error(url: str) -> str:
+	try:
+		return _fetch_html(url)
+	except (HTTPError, URLError, TimeoutError, ValueError) as exc:
+		raise ValueError(f"Failed to fetch {url}: {exc}") from exc
+
+
 def _clean_text(value: Optional[str]) -> Optional[str]:
 	if value is None:
 		return None
 	text = re.sub(r"\s+", " ", unescape(value)).strip()
 	return text or None
-
-
-def _extract_text_from_html(fragment: str) -> str:
-	return _clean_text(BeautifulSoup(fragment, "html.parser").get_text(" ", strip=True)) or ""
 
 
 def _normalize_date(text: Optional[str]) -> Optional[str]:
@@ -164,18 +238,10 @@ def _parse_with_bs4(html: str, base_url: str) -> list[RawItem]:
 	candidates: list[RawItem] = []
 	seen: set[tuple[str, str]] = set()
 
-	selectors = [
-		"div.news-item",
-		"article.node-hir",
-		"div.bme_news_card",
-		"a.h-p100.d-block",
-		"div.event",
-	]
-
-	for selector in selectors:
+	for selector in NEWS_ITEM_SELECTORS:
 		for node in soup.select(selector):
 			title_node = node.select_one(
-				"h2 a, h4 a, .node__title a, .event-title, .bme_event_card-title, h2, h4, .bme_news_card-title"
+				", ".join(NEWS_ITEM_TITLE_SELECTORS)
 			)
 			if title_node is None:
 				continue
@@ -204,16 +270,16 @@ def _parse_with_bs4(html: str, base_url: str) -> list[RawItem]:
 			seen.add(dedupe_key)
 
 			summary_node = node.select_one(
-				".news-excerpt, .news-content p, .bme_news_card-body p, .bme_event_card-body p, .field-name-body p, .field--name-body p"
+				", ".join(NEWS_ITEM_SUMMARY_SELECTORS)
 			)
 			summary = _clean_text(summary_node.get_text(" ", strip=True)) if summary_node else None
 
 			date_node = node.select_one(
-				".news-date, .event-date, .bme_event_card-date, .field--name-created, .created, time, datetime"
+				", ".join(NEWS_ITEM_DATE_SELECTORS)
 			)
 			published_at = _normalize_date(date_node.get_text(" ", strip=True) if date_node else None)
 
-			location_node = node.select_one(".bme_event_card-location")
+			location_node = node.select_one(", ".join(NEWS_ITEM_LOCATION_SELECTORS))
 			location = _clean_text(location_node.get_text(" ", strip=True)) if location_node else None
 
 			image_node = node.select_one("img")
@@ -235,16 +301,96 @@ def _parse_with_bs4(html: str, base_url: str) -> list[RawItem]:
 				)
 			)
 
+	if not candidates:
+		logger.warning("No news or event items found for %s", base_url)
+
 	return candidates
+
+
+def _first_text_by_selectors(soup: BeautifulSoup, selectors: tuple[str, ...]) -> Optional[str]:
+	for selector in selectors:
+		node = soup.select_one(selector)
+		if node is None:
+			continue
+		content = node.get("content")
+		if content:
+			text = _clean_text(content)
+			if text:
+				return text
+		text = _clean_text(node.get_text(" ", strip=True))
+		if text:
+			return text
+	return None
+
+
+def _extract_entry_text_block(soup: BeautifulSoup) -> tuple[Optional[str], str]:
+	title = _first_text_by_selectors(
+		soup,
+		ENTRY_TEXT_TITLE_SELECTORS,
+	)
+	container = None
+	for selector in ENTRY_TEXT_CONTAINER_SELECTORS:
+		container = soup.select_one(selector)
+		if container is not None:
+			break
+	if container is None:
+		container = soup.body or soup
+
+	lines: list[str] = []
+	for element in container.select("p, li"):
+		text = _clean_text(element.get_text(" ", strip=True))
+		if not text:
+			continue
+		if element.name == "li":
+			text = f"- {text}"
+		lines.append(text)
+
+	if not lines:
+		raw_text = _clean_text(container.get_text("\n", strip=True))
+		if raw_text:
+			lines = [line for line in (segment.strip() for segment in raw_text.splitlines()) if line]
+
+	return title, "\n".join(lines).strip()
+
+
+@mcp.tool()
+def extract_entry_text(urls: list[AnyHttpUrl]) -> list[dict[str, object]]:
+	"""Fetch multiple valid URLs and return each page's main entry text.
+
+	For each input URL (BME-S, BME-TMIT, BME-VIK style articles) the tool:
+	- downloads the page,
+	- extracts the title and the main body text (paragraphs and lists),
+	- validates the result with Pydantic, and
+	- returns a JSON-serializable list of objects with `source_url`, `title`, and `text`.
+	"""
+
+	results: list[dict[str, object]] = []
+
+	for url in urls:
+		source = str(url)
+		html = _fetch_html_or_error(source)
+		soup = BeautifulSoup(html, "html.parser")
+		title, text = _extract_entry_text_block(soup)
+		validated = EntryTextResponse.model_validate(
+			{
+				"source_url": source,
+				"title": title,
+				"text": text,
+			}
+		)
+		results.append(validated.model_dump(mode="json"))
+
+	return results
+
 @mcp.tool()
 def extract_news_and_events(urls: list[AnyHttpUrl]) -> list[dict[str, object]]:
 	"""Fetch each URL, parse the page HTML, and return normalized news/event items.
 
-	The tool is meant for BME/VIK/TMIT-style pages that list multiple items in the same
-	HTML document. For every input URL it:
+	Use this tool for index/list pages that contain multiple BME/VIK/TMIT news or
+	event cards in the same HTML document. For every input URL it:
 	1. downloads the page,
 	2. finds news or event blocks,
-	3. extracts the title, item URL, publication date, summary, and image URL when present,
+	3. extracts the title, item URL, publication date, summary, location, and image URL when present,
 	4. normalizes the date to ISO-8601 when possible,
 	5. deduplicates repeated items across URLs.
 
@@ -257,10 +403,7 @@ def extract_news_and_events(urls: list[AnyHttpUrl]) -> list[dict[str, object]]:
 
 	for url in urls:
 		source_url = str(url)
-		try:
-			html = _fetch_html(source_url)
-		except (HTTPError, URLError, TimeoutError, ValueError) as exc:
-			raise ValueError(f"Failed to fetch {source_url}: {exc}") from exc
+		html = _fetch_html_or_error(source_url)
 
 		for raw_item in _parse_with_bs4(html, source_url):
 			dedupe_key = (raw_item.title.lower(), raw_item.item_url)
