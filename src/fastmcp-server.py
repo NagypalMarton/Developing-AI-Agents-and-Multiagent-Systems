@@ -32,6 +32,33 @@ EVENT_KEYWORDS = (
 	"találkozó",
 )
 
+EVENT_GUEST_KEYWORDS = (
+	"résztvevők",
+	"résztvevő",
+	"előadók",
+	"előadó",
+	"meghívott",
+	"vendég",
+	"guest",
+	"guests",
+	"speaker",
+	"speakers",
+)
+
+REGISTRATION_URL_KEYWORDS = (
+	"registration",
+	"regisztráció",
+	"regisztracio",
+	"jelentkezés",
+	"jelentkezes",
+	"signup",
+	"sign-up",
+	"register",
+)
+
+UNKNOWN_GUESTS_LIST = "Nem Ismert"
+UNKNOWN_REGISTRATION_URL = "Nem található"
+
 NEWS_ITEM_SELECTORS = (
 	"div.news-item",
 	"article.node-hir",
@@ -146,6 +173,8 @@ class NewsItem(BaseModel):
 	published_at: Optional[str] = None
 	summary: Optional[str] = None
 	location: Optional[str] = None
+	guests_list: Optional[str] = None
+	registration_url: Optional[str] = None
 	image_url: Optional[AnyHttpUrl] = None
 
 
@@ -164,6 +193,8 @@ class RawItem:
 	summary: Optional[str] = None
 	published_at: Optional[str] = None
 	location: Optional[str] = None
+	guests_list: Optional[str] = None
+	registration_url: Optional[str] = None
 	image_url: Optional[str] = None
 	category: str = "unknown"
 
@@ -232,6 +263,74 @@ def _detect_category(title: str, summary: Optional[str], url: str) -> str:
 	return "unknown"
 
 
+def _normalize_guests_list(text: Optional[str]) -> Optional[str]:
+	cleaned = _clean_text(text)
+	if not cleaned:
+		return None
+	if not re.search(r"[:\-–]", cleaned) and not re.search(r"\b(?:és|and)\b|[,;/]", cleaned, flags=re.IGNORECASE):
+		return None
+	cleaned = re.sub(
+		r"^(?:résztvevők|résztvevő|előadók|előadó|meghívott|vendég|guest(?:s)?|speaker(?:s)?)\s*[:\-–]\s*",
+		"",
+		cleaned,
+		flags=re.IGNORECASE,
+	)
+	parts = [part.strip(" .;:") for part in re.split(r"[,;/]|\s+és\s+|\s+and\s+", cleaned, flags=re.IGNORECASE)]
+	names = [part for part in parts if part]
+	return ", ".join(names) if names else cleaned
+
+
+def _extract_event_guests_list(node) -> Optional[str]:
+	for selector in ("p", "li", "div", "span", "strong", "b"):
+		for element in node.select(selector):
+			text = _clean_text(element.get_text(" ", strip=True))
+			if not text:
+				continue
+			lower_text = text.lower()
+			if not any(keyword in lower_text for keyword in EVENT_GUEST_KEYWORDS):
+				continue
+			guests = _normalize_guests_list(text)
+			if guests:
+				return guests
+
+	raw_text = _clean_text(node.get_text("\n", strip=True))
+	if not raw_text:
+		return None
+
+	for line in (segment.strip() for segment in raw_text.splitlines()):
+		if not line:
+			continue
+		lower_line = line.lower()
+		if not any(keyword in lower_line for keyword in EVENT_GUEST_KEYWORDS):
+			continue
+		guests = _normalize_guests_list(line)
+		if guests:
+			return guests
+
+	return None
+
+
+def _extract_registration_url(node, base_url: str) -> Optional[str]:
+	for link in node.select("a[href]"):
+		href = link.get("href")
+		if not href:
+			continue
+		link_text = _clean_text(link.get_text(" ", strip=True)) or ""
+		haystack = f"{href} {link_text}".lower()
+		if any(keyword in haystack for keyword in REGISTRATION_URL_KEYWORDS):
+			return urljoin(base_url, href)
+
+	text = _clean_text(node.get_text(" ", strip=True)) or ""
+	if not text:
+		return None
+	for match in re.finditer(r"https?://\S+", text):
+		candidate = match.group(0).rstrip(").,;:")
+		if any(keyword in candidate.lower() for keyword in REGISTRATION_URL_KEYWORDS):
+			return candidate
+
+	return None
+
+
 def _parse_with_bs4(html: str, base_url: str) -> list[RawItem]:
 	soup = BeautifulSoup(html, "html.parser")
 
@@ -281,6 +380,12 @@ def _parse_with_bs4(html: str, base_url: str) -> list[RawItem]:
 
 			location_node = node.select_one(", ".join(NEWS_ITEM_LOCATION_SELECTORS))
 			location = _clean_text(location_node.get_text(" ", strip=True)) if location_node else None
+			category = _detect_category(title, summary, item_url)
+			guests_list = None
+			registration_url = None
+			if category == "event":
+				guests_list = _extract_event_guests_list(node) or UNKNOWN_GUESTS_LIST
+				registration_url = _extract_registration_url(node, base_url) or UNKNOWN_REGISTRATION_URL
 
 			image_node = node.select_one("img")
 			image_url = None
@@ -296,8 +401,10 @@ def _parse_with_bs4(html: str, base_url: str) -> list[RawItem]:
 					summary=summary,
 					published_at=published_at,
 					location=location,
+					guests_list=guests_list,
+					registration_url=registration_url,
 					image_url=image_url,
-					category=_detect_category(title, summary, item_url),
+					category=category,
 				)
 			)
 
@@ -395,7 +502,8 @@ def extract_news_and_events(urls: list[AnyHttpUrl]) -> list[dict[str, object]]:
 	5. deduplicates repeated items across URLs.
 
 	The result is a JSON-serializable list of validated records with keys:
-	source_url, title, item_url, category, published_at, summary, location, and image_url.
+	source_url, title, item_url, category, published_at, summary, location, guests_list,
+	registration_url, and image_url.
 	"""
 
 	items: list[NewsItem] = []
