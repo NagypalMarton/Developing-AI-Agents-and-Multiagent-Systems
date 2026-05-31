@@ -9,7 +9,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlparse
 from urllib.request import Request, urlopen
 
-from bs4 import BeautifulSoup, Comment
+from bs4 import BeautifulSoup
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import BaseModel, Field
@@ -328,70 +328,55 @@ def _parse_listing_page(html: str, url: str) -> list[News]:
 	articles: list[News] = []
 	seen_urls: set[str] = set()
 
-	for anchor in soup.find_all("a", href=True):
-		href = anchor.get("href", "")
-		absolute_url = urljoin(url, href)
-		if absolute_url in seen_urls:
-			continue
-		if not _looks_like_article_link(href, url):
-			continue
-		if anchor.find_parent(["nav", "header", "footer", "aside", "form", "script"]):
-			continue
+	# Prefer explicit, structured containers over link/path heuristics.
+	news_container_selectors = [
+		"article",
+		".news-item",
+		".views-row",
+		".bme_news_card",
+		".node",
+		".news-content",
+		".news-excerpt",
+		".news-title-important",
+		".bme_news_card-title",
+		".bme_news_card-body",
+		".field--name-field-bevezto-kep",
+		".field--name-created",
+		".field.field--name-created",
+	]
 
-		container = anchor.find_parent(["article", "li", "section", "div", "main"]) or anchor.parent
-		if container is None:
-			continue
-
-		title = _clean_text(anchor.get_text(" ", strip=True))
-		if not title or len(title) < 4:
-			continue
-
-		container_text = _extract_visible_text(container)
-		if len(container_text) < len(title) + 20:
-			continue
-
-		date_text = ""
-		for selector in ["time", ".date", ".submitted", ".field--name-field-date", ".field-name-field-date"]:
-			element = container.select_one(selector)
-			if element is None:
-				continue
-			candidate = element.get("datetime") if element.name == "time" else element.get_text(" ", strip=True)
-			candidate = _clean_text(candidate)
-			if not candidate:
-				continue
-			try:
-				if re.fullmatch(r"\d{4}-\d{2}-\d{2}(?:[T ].*)?", candidate):
-					date_text = _canonical_date(int(candidate[:4]), int(candidate[5:7]), int(candidate[8:10]))
-				else:
-					date_text = _normalize_date_string(candidate)
-				break
-			except ValueError:
+	for selector in news_container_selectors:
+		for container in soup.select(selector):
+			# Title
+			title_el = container.select_one("h1, h2, h3, .node__title, .bme_news_card-title, .news-title-important")
+			title = _clean_text(title_el.get_text(" ", strip=True)) if title_el else ""
+			if not title:
 				continue
 
-		if not date_text:
-			for pattern in (
-				re.search(r"\d{4}[./\- ]+[A-Za-zÁÉÍÓÖŐÚÜŰáéíóöőúüű]+[./\- ]+\d{1,2}", container_text),
-				re.search(r"\d{4}[./\- ]+\d{1,2}[./\- ]+\d{1,2}", container_text),
-				re.search(r"[A-Za-zÁÉÍÓÖŐÚÜŰáéíóöőúüű]+\s+\d{1,2},?\s+20\d{2}", container_text),
-			):
-				if pattern:
-					try:
-						date_text = _normalize_date_string(pattern.group(0))
-						break
-					except ValueError:
-						continue
+			# URL (anchor inside container)
+			anchor = container.select_one("a[href]")
+			absolute_url = urljoin(url, anchor.get("href")) if anchor else url
+			if absolute_url in seen_urls:
+				continue
 
-		content_text = _find_summary_text(container, title, date_text) or title
+			# Date: prefer time[datetime] or known date elements
+			date_el = container.select_one("time[datetime], .news-date, .field--name-created, .field.field--name-created, span.field--name-created")
+			date_text = ""
+			if date_el:
+				raw = date_el.get("datetime") if date_el.name == "time" else _clean_text(date_el.get_text(" ", strip=True))
+				try:
+					date_text = _normalize_date_string(raw)
+				except Exception:
+					date_text = _clean_text(raw)
 
-		articles.append(
-			News(
-				title=title,
-				date=date_text,
-				content=content_text,
-				url=absolute_url,
+			# Content/summary
+			content_el = container.select_one(".news-excerpt, .bme_news_card-body p, .field-name-body, .news-content, .field--name-body")
+			content_text = _clean_text(content_el.get_text(" ", strip=True)) if content_el else _find_summary_text(container, title, date_text) or title
+
+			articles.append(
+				News(title=title, date=date_text, content=content_text, url=absolute_url)
 			)
-		)
-		seen_urls.add(absolute_url)
+			seen_urls.add(absolute_url)
 
 	return articles
 
@@ -430,38 +415,69 @@ def _append_unique_block(blocks, seen_ids, candidate) -> None:
 	seen_ids.add(container_id)
 
 
+def _anchor_article_candidate_container(anchor, base_url: str):
+	href = anchor.get("href", "")
+	if not _looks_like_article_link(href, base_url):
+		return None
+	if anchor.find_parent(["nav", "header", "footer", "aside", "form", "script"]):
+		return None
+
+	container = anchor.find_parent(["article", "li", "section", "div", "main"]) or anchor.parent
+	if container is None:
+		return None
+
+	title = _clean_text(anchor.get_text(" ", strip=True))
+	if not title or len(title) < 4:
+		return None
+
+	container_text = _extract_visible_text(container)
+	if len(container_text) < len(title) + 20:
+		return None
+
+	return container
+
+
+def _looks_like_event_container(container) -> bool:
+	classes = " ".join(container.get("class") or [])
+	if (
+		"event" not in classes.lower()
+		and "vevent" not in classes.lower()
+		and "program" not in classes.lower()
+		and "agenda" not in classes.lower()
+		and not container.select_one("time")
+		and "event" not in container.get_text(" ", strip=True).lower()
+	):
+		return False
+	return True
+
+
 def _collect_news_blocks(soup: BeautifulSoup, url: str):
 	blocks = []
 	seen_ids: set[int] = set()
 
-	for selector in ["article", "main", ".node__content", ".field--name-body", ".content", "#content"]:
-		element = soup.select_one(selector)
-		if element is None:
-			continue
-		if _extract_visible_text(element):
-			_append_unique_block(blocks, seen_ids, element)
+	# Use explicit, structured selectors from common news templates.
+	structured_selectors = [
+		"article",
+		".news-item",
+		".views-row",
+		".bme_news_card",
+		".node",
+		"main",
+		"#content",
+		".news-content",
+		".news-excerpt",
+		".news-title-important",
+		".bme_news_card-title",
+		".bme_news_card-body",
+		".field--name-field-bevezto-kep",
+		".field--name-created",
+		".field.field--name-created",
+	]
 
-	for anchor in soup.find_all("a", href=True):
-		href = anchor.get("href", "")
-		absolute_url = urljoin(url, href)
-		if not _looks_like_article_link(href, url):
-			continue
-		if anchor.find_parent(["nav", "header", "footer", "aside", "form", "script"]):
-			continue
-
-		container = anchor.find_parent(["article", "li", "section", "div", "main"]) or anchor.parent
-		if container is None:
-			continue
-
-		title = _clean_text(anchor.get_text(" ", strip=True))
-		if not title or len(title) < 4:
-			continue
-
-		container_text = _extract_visible_text(container)
-		if len(container_text) < len(title) + 20:
-			continue
-
-		_append_unique_block(blocks, seen_ids, container)
+	for selector in structured_selectors:
+		for element in soup.select(selector):
+			if _extract_visible_text(element):
+				_append_unique_block(blocks, seen_ids, element)
 
 	return blocks
 
@@ -470,47 +486,19 @@ def _collect_event_blocks(soup: BeautifulSoup, url: str):
 	blocks = []
 	seen_ids: set[int] = set()
 
-	for container in soup.find_all(["article", "li", "section", "div"]):
-		classes = " ".join(container.get("class") or [])
-		text = _extract_visible_text(container)
-		if (
-			"event" not in classes.lower()
-			and "vevent" not in classes.lower()
-			and "program" not in classes.lower()
-			and "agenda" not in classes.lower()
-			and not container.select_one("time")
-			and "event" not in container.get_text(" ", strip=True).lower()
-		):
-			continue
+	# Require explicit date/time or semantic markup for events to avoid fuzzy heuristics.
+	event_selectors = [".event", ".vevent", "article", ".program", ".agenda", ".views-row", ".event-date", ".news-date", ".field--name-created", ".field--name-field-bevezto-kep"]
 
-		title = ""
-		for sel in ("h1", "h2", "h3", "a", "strong"):
-			el = container.select_one(sel)
-			if el and _clean_text(el.get_text(" ", strip=True)):
-				title = _clean_text(el.get_text(" ", strip=True))
-				break
-		if not title:
-			continue
+	for selector in event_selectors:
+		for container in soup.select(selector):
+			# only accept containers with an explicit time/meta or recognizable title
+			if not _looks_like_event_container(container):
+				continue
 
-		date_text = ""
-		time_el = container.select_one("time")
-		if time_el:
-			raw = time_el.get("datetime") or time_el.get_text(" ", strip=True)
-			raw = _clean_text(raw)
-			if raw:
-				date_text = raw
+			if not container.select_one("time[datetime], time") and not container.select_one(".field--name-created, .event-date, .news-date"):
+				continue
 
-		if not date_text:
-			for pattern in (
-				re.search(r"\d{4}[./\- ]+[A-Za-zÁÉÍÓÖŐÚÜŰáéíóöőúüű]+[./\- ]+\d{1,2}", text),
-				re.search(r"\d{4}[./\- ]+\d{1,2}[./\- ]+\d{1,2}", text),
-				re.search(r"[A-Za-zÁÉÍÓÖŐÚÜŰáéíóöőúüű]+\s+\d{1,2},?\s+20\d{2}", text),
-			):
-				if pattern:
-					date_text = pattern.group(0)
-					break
-
-		_append_unique_block(blocks, seen_ids, container)
+			_append_unique_block(blocks, seen_ids, container)
 
 	return blocks
 
@@ -641,17 +629,10 @@ def _parse_events_html(html: str, url: str) -> list[Event]:
 	# Candidate containers: elements that often contain event info
 	candidates = soup.find_all(["article", "li", "section", "div"])
 	for container in candidates:
-		classes = " ".join(container.get("class") or [])
-		text = _extract_visible_text(container)
-		if (
-			"event" not in classes.lower()
-			and "vevent" not in classes.lower()
-			and "program" not in classes.lower()
-			and "agenda" not in classes.lower()
-			and not container.select_one("time")
-			and "event" not in container.get_text(" ", strip=True).lower()
-		):
+		if not _looks_like_event_container(container):
 			continue
+
+		text = _extract_visible_text(container)
 
 		# Title
 		title = ""
