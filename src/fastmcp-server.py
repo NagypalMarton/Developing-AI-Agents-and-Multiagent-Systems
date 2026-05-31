@@ -5,6 +5,7 @@ from datetime import datetime
 from html import unescape
 from html.parser import HTMLParser
 from typing import Optional
+import os
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin
 from urllib.request import Request, urlopen
@@ -423,4 +424,11 @@ def normalize_source_urls(urls: list[AnyHttpUrl]) -> list[str]:
 
 
 if __name__ == "__main__":
-	mcp.run(transport="stdio")
+	transport = os.getenv("FASTMCP_TRANSPORT", "stdio")
+	if transport in ("http", "streamable-http", "sse"):
+		host = os.getenv("FASTMCP_HOST", "0.0.0.0")
+		port = int(os.getenv("FASTMCP_PORT", "8000"))
+		path = os.getenv("FASTMCP_PATH", "/mcp")
+		mcp.run(transport=transport, host=host, port=port, path=path)
+	else:
+		mcp.run(transport="stdio")
