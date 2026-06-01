@@ -406,6 +406,63 @@ def _detect_category_from_html(node) -> Literal["news", "event"]:
 	if any("event" in cls for cls in classes):
 		return "event"
 	return "news"
+
+
+def _extract_detail_page_item(
+	soup: BeautifulSoup,
+	base_url: str,
+	category: Literal["news", "event"],
+) -> Optional[RawItem]:
+	title = _extract_item_title(soup)
+	if not title:
+		return None
+
+	published_at = None
+	location = None
+	image_url = _extract_image_url(soup, base_url)
+
+	if category == "news":
+		summary = _extract_entry_text_block(soup)
+		date_node = soup.select_one(
+			", ".join(NEWS_ITEM_DATE_SELECTORS)
+		)
+		published_at = _normalize_date(date_node.get_text(" ", strip=True) if date_node else None)
+		return RawItem(
+			title=title,
+			item_url=base_url,
+			category="news",
+			source_url=base_url,
+			published_at=published_at,
+			summary=summary,
+			image_url=image_url,
+		)
+
+	date_node = soup.select_one(
+		", ".join(EVENT_ITEM_DATE_SELECTORS)
+	)
+	published_at = _normalize_date(date_node.get_text(" ", strip=True) if date_node else None)
+	location_node = soup.select_one(
+		", ".join(EVENT_ITEM_LOCATION_SELECTORS)
+	)
+	location = _clean_text(location_node.get_text(" ", strip=True)) if location_node else None
+	text = _extract_entry_text_block(soup)
+	guests_list = _extract_event_guests_list(soup) or "Nem Ismert"
+	registration_url = _extract_registration_url(soup, base_url) or "Nem található"
+
+	return RawItem(
+		title=title,
+		item_url=base_url,
+		category="event",
+		source_url=base_url,
+		published_at=published_at,
+		text=text,
+		location=location,
+		guests_list=guests_list,
+		registration_url=registration_url,
+		image_url=image_url,
+	)
+
+
 def _parse_with_bs4(
 	html: str,
 	base_url: str,
@@ -533,6 +590,12 @@ def _parse_with_bs4(
 							image_url=image_url,
 						)
 					)
+
+	if not candidates:
+		if category is not None:
+			detail_item = _extract_detail_page_item(soup, base_url, category)
+			if detail_item is not None:
+				candidates.append(detail_item)
 
 	if not candidates:
 		logger.warning("No news or event items found for %s", base_url)
