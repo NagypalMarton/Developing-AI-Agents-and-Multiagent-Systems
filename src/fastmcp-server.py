@@ -267,6 +267,19 @@ def _normalize_date(text: Optional[str]) -> Optional[str]:
 	return cleaned
 
 
+def _is_recent_news_date(published_at: Optional[str], max_age_days: int = 3) -> bool:
+	if not published_at:
+		return False
+
+	try:
+		published_date = datetime.fromisoformat(published_at).date()
+	except ValueError:
+		return False
+
+	current_date = datetime.now().date()
+	return 0 <= (current_date - published_date).days <= max_age_days
+
+
 def _first_text_by_selectors(node, selectors: tuple[str, ...]) -> Optional[str]:
 	for selector in selectors:
 		match = node.select_one(selector)
@@ -427,6 +440,8 @@ def _extract_detail_page_item(
 			", ".join(NEWS_ITEM_DATE_SELECTORS)
 		)
 		published_at = _normalize_date(date_node.get_text(" ", strip=True) if date_node else None)
+		if not _is_recent_news_date(published_at):
+			return None
 		return RawItem(
 			title=title,
 			item_url=base_url,
@@ -533,6 +548,8 @@ def _parse_with_bs4(
 					", ".join(NEWS_ITEM_DATE_SELECTORS)
 				)
 				published_at = _normalize_date(date_node.get_text(" ", strip=True) if date_node else None)
+				if not _is_recent_news_date(published_at):
+					continue
 
 				if category in (None, "news"):
 					candidates.append(
